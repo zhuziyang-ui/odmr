@@ -10,6 +10,7 @@ const MicrowavePage = lazy(() => import("./pages/MicrowavePage"));
 const OdmrPage = lazy(() => import("./pages/OdmrPage"));
 const CurrentPage = lazy(() => import("./pages/CurrentPage"));
 const StateEstimationPage = lazy(() => import("./pages/StateEstimationPage"));
+const AccuracyPage = lazy(() => import("./pages/AccuracyPage"));
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/odmr" element={<OdmrPage />} />
           <Route path="/current" element={<CurrentPage />} />
           <Route path="/state-estimation" element={<StateEstimationPage />} />
+          <Route path="/accuracy" element={<AccuracyPage />} />
         </Routes>
       </Suspense>
     </AppFrame>

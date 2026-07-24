@@ -9,6 +9,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.app.core.config import settings
+from backend.app.routers.accuracy import router as accuracy_router
 from backend.app.routers.instruments import router as instrument_router
 from backend.app.routers.measurement import router as measurement_router
 from backend.app.routers.state_estimation import router as state_estimation_router
@@ -28,6 +29,7 @@ app.include_router(system_router)
 app.include_router(instrument_router)
 app.include_router(measurement_router)
 app.include_router(state_estimation_router)
+app.include_router(accuracy_router)
 
 
 @app.get("/")

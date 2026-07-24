@@ -109,6 +109,41 @@ export const api = {
       `/measurement/current/tracking/recording/download${query}`
     );
   },
+  accuracyDefaults: () => request("/accuracy/defaults"),
+  accuracyMap: (payload) =>
+    request("/accuracy/map", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  accuracyTables: (payload) =>
+    request("/accuracy/tables", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  accuracyPitchAngle: (ratioErrorPercent) => {
+    const query = new URLSearchParams({
+      ratio_error_percent: String(ratioErrorPercent),
+    });
+    return request(`/accuracy/pitch-angle?${query.toString()}`);
+  },
+  accuracyExportCsv: async (tableName, payload) => {
+    const response = await fetch(`${API_BASE}/accuracy/export-csv/${tableName}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Request failed: ${response.status}`);
+    }
+    const blob = await response.blob();
+    return { blob, filename: `${tableName}.csv` };
+  },
+  accuracyExportAll: (payload) =>
+    request("/accuracy/export-all", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };
 
 export function wsUrl(path) {

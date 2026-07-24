@@ -1,5 +1,20 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
+.env
+*.log
+
 frontend/node_modules/
 frontend/dist/
+
 data/current_tracking/
+data/standards/
+
+# local temp / helper artifacts
+_write_bats.py
+_fe_out.txt
+_fe_err.txt
+_smoke.bat
+*.xlsx
+
