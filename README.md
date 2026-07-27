@@ -17,6 +17,7 @@
 - `/current`：电流测量页，使用 FM 一次谐波 `R=|X+jY|` 的“双瓣-谷-双瓣”结构识别物理共振、X/Y 复数 b/g 投影鉴频、左右独立受限 PID、局部/全频重捕获、时间对齐 Δf 和实时电流换算
 - `/state-estimation`：独立的 EKF/UKF 双峰联合状态估计页，支持运动预测、95% 可信区间、创新门限、短时信号丢失预测和不确定度触发全频重扫
 - `/accuracy`：GB/T 20840.2 计量 0.2/0.2S 准确度表、δf(kHz)→δI(A) 映射、频率容限与俯仰几何预算、CSV 导出（无需连接仪器）
+- 独立仿真 UI（不连仪器）：`scripts/start_odmr_pitch_ui.bat` — A/B 俯仰 → 四族 NV ODMR 交互谱（Streamlit）
 
 ## EKF / UKF 双峰联合状态估计
 

@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 title NV ODMR Frontend
@@ -19,14 +19,18 @@ if errorlevel 1 (
   exit /b 1
 )
 
-where npm >nul 2>&1
+where npm.cmd >nul 2>&1
 if errorlevel 1 (
-  echo [ERROR] npm not found. Install Node.js LTS.
-  pause
-  exit /b 1
+  where npm >nul 2>&1
+  if errorlevel 1 (
+    echo [ERROR] npm not found. Install Node.js LTS and reopen the terminal.
+    echo         https://nodejs.org/
+    pause
+    exit /b 1
+  )
 )
 
-if not exist node_modules (
+if not exist node_modules\vite\package.json (
   echo Installing frontend dependencies...
   call npm.cmd install
   if errorlevel 1 (
@@ -37,9 +41,17 @@ if not exist node_modules (
 )
 
 echo.
-echo Starting Vite...
+echo Starting Vite on 127.0.0.1:5173 (strictPort)...
+echo If this window closes or errors, port 5173 may still be occupied.
 echo.
+
 call npm.cmd run dev:local
+set "EC=%ERRORLEVEL%"
 echo.
-echo Frontend exited.
+if not "%EC%"=="0" (
+  echo [ERROR] Frontend exited with code %EC%
+) else (
+  echo Frontend exited.
+)
 pause
+exit /b %EC%

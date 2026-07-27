@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+from backend.app.schemas.instruments import (
+    DEFAULT_FREQ_START_HZ,
+    DEFAULT_FREQ_STEP_HZ,
+    DEFAULT_FREQ_STOP_HZ,
+    MAX_LINEAR_SWEEP_POINTS,
+    fill_step_from_points_dict,
+    resolve_points_from_step,
+)
 
 
 class StateEstimationTrackingRequest(BaseModel):
@@ -11,9 +20,11 @@ class StateEstimationTrackingRequest(BaseModel):
     estimator_type: Literal["ekf", "ukf"] = "ekf"
     channel_index: int = Field(default=0, ge=0)
 
-    start_hz: float = 2.83e9
-    stop_hz: float = 2.91e9
-    search_points: int = Field(default=121, ge=11, le=4001)
+    # 起止 + 步进(默认 10 kHz) → 自动算 search_points
+    start_hz: float = DEFAULT_FREQ_START_HZ
+    stop_hz: float = DEFAULT_FREQ_STOP_HZ
+    search_step_hz: float = Field(default=DEFAULT_FREQ_STEP_HZ, gt=0.0)
+    search_points: int = Field(default=42001, ge=11, le=MAX_LINEAR_SWEEP_POINTS)
     search_settle_ms: float = Field(default=10.0, ge=0.1, le=5000.0)
     tracking_settle_ms: float = Field(default=3.0, ge=0.1, le=5000.0)
     sample_averages: int = Field(default=1, ge=1, le=100)
@@ -53,10 +64,26 @@ class StateEstimationTrackingRequest(BaseModel):
     calibration_delta_f_min_hz: float | None = None
     calibration_delta_f_max_hz: float | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_step_from_legacy_points(cls, data: Any) -> Any:
+        return fill_step_from_points_dict(
+            data,
+            start_key="start_hz",
+            stop_key="stop_hz",
+            step_key="search_step_hz",
+            points_key="search_points",
+        )
+
     @model_validator(mode="after")
     def validate_ranges(self) -> "StateEstimationTrackingRequest":
-        if self.stop_hz <= self.start_hz:
-            raise ValueError("跟踪终止频率必须大于起始频率。")
+        self.search_points = resolve_points_from_step(
+            self.start_hz,
+            self.stop_hz,
+            self.search_step_hz,
+            min_points=11,
+            label="状态估计搜索扫频",
+        )
         if self.delta_f_max_hz <= self.delta_f_min_hz:
             raise ValueError("Δf 物理上限必须大于下限。")
         bounds = (

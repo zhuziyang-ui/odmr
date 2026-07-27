@@ -18,6 +18,14 @@ import { PlotCard } from "../components/PlotCard";
 import { SectionCard } from "../components/SectionCard";
 import { useDashboard } from "../hooks/useDashboard";
 import { api, formatGHz, shortReadout, wsUrl } from "../lib/api";
+import {
+  DEFAULT_FREQ_START_HZ,
+  DEFAULT_FREQ_STEP_HZ,
+  DEFAULT_FREQ_STOP_HZ,
+  computeLinearSweepPoints,
+  deriveStepHz,
+  formatStepHz,
+} from "../lib/sweep";
 
 function toFiniteNumber(value, fallback = 0) {
   const parsed = Number(value);
@@ -64,20 +72,46 @@ function createEmptyTrace() {
 }
 
 function createDefaultOdmrForm(lastRequest = {}) {
-  return {
+  // 起止 + 步进(默认 10 kHz) → 自动算点数
+  const merged = {
     scan_mode: "software_sync",
     readout_source: "r_v",
-    start_hz: 2.83e9,
-    stop_hz: 2.91e9,
-    points: 161,
+    start_hz: DEFAULT_FREQ_START_HZ,
+    stop_hz: DEFAULT_FREQ_STOP_HZ,
+    step_hz: DEFAULT_FREQ_STEP_HZ,
+    points: 42001,
     dwell_ms: 8,
     averages: 4,
     aux_voltage_min_v: 0,
     aux_voltage_max_v: 10,
-    aux_frequency_min_hz: 2.82e9,
-    aux_frequency_max_hz: 2.92e9,
+    aux_frequency_min_hz: DEFAULT_FREQ_START_HZ,
+    aux_frequency_max_hz: DEFAULT_FREQ_STOP_HZ,
     ...lastRequest,
   };
+  const stepHz =
+    Number(merged.step_hz) > 0
+      ? Number(merged.step_hz)
+      : deriveStepHz(merged.start_hz, merged.stop_hz, merged.points, DEFAULT_FREQ_STEP_HZ);
+  const calc = computeLinearSweepPoints(merged.start_hz, merged.stop_hz, stepHz, 3);
+  return {
+    ...merged,
+    step_hz: stepHz,
+    points: calc.points ?? merged.points,
+  };
+}
+
+function patchOdmrSweepFields(prev, changes) {
+  const next = { ...prev, ...changes };
+  const stepHz =
+    Number(next.step_hz) > 0
+      ? Number(next.step_hz)
+      : DEFAULT_FREQ_STEP_HZ;
+  next.step_hz = stepHz;
+  const calc = computeLinearSweepPoints(next.start_hz, next.stop_hz, stepHz, 3);
+  if (calc.points != null) {
+    next.points = calc.points;
+  }
+  return next;
 }
 
 function createDefaultSensitivityForm(lastRequest = {}, activeChannel = 0) {
@@ -670,11 +704,12 @@ export default function OdmrPage() {
 
   const runOdmr = () => {
     const socket = odmrSocketRef.current;
-    if (toFiniteNumber(odmrForm.start_hz) >= toFiniteNumber(odmrForm.stop_hz)) {
-      notifications.show({ color: "red", title: "参数错误", message: "起始频率必须小于终止频率" });
+    const calc = computeLinearSweepPoints(odmrForm.start_hz, odmrForm.stop_hz, odmrForm.step_hz, 3);
+    if (calc.error) {
+      notifications.show({ color: "red", title: "参数错误", message: calc.error });
       return;
     }
-    if (toFiniteNumber(odmrForm.points) < 3) {
+    if (toFiniteNumber(calc.points) < 3) {
       notifications.show({ color: "red", title: "参数错误", message: "扫描点数至少为 3" });
       return;
     }
@@ -689,9 +724,14 @@ export default function OdmrPage() {
         message: "锁相或微波源未连接时，ODMR 可能退回到模拟 trace",
       });
     }
+    const odmrPayload = {
+      ...odmrForm,
+      step_hz: toFiniteNumber(odmrForm.step_hz, DEFAULT_FREQ_STEP_HZ),
+      points: calc.points,
+    };
     setOdmrProgress(0);
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      pendingOdmrRef.current = { ...odmrForm };
+      pendingOdmrRef.current = odmrPayload;
       setOdmrStatusText("等待 ODMR WebSocket 建立");
       notifications.show({
         color: "yellow",
@@ -700,8 +740,8 @@ export default function OdmrPage() {
       });
       return;
     }
-    setOdmrStatusText("准备启动扫描");
-    socket.send(JSON.stringify(odmrForm));
+    setOdmrStatusText(`准备启动扫描（${calc.points} 点，步进 ${formatStepHz(odmrPayload.step_hz)}）`);
+    socket.send(JSON.stringify(odmrPayload));
   };
 
   const stopOdmr = async () => {
@@ -761,14 +801,27 @@ export default function OdmrPage() {
 
   const syncFromMicrowave = () => {
     const microwaveConfig = data.microwave.config || {};
-    setOdmrForm((prev) => ({
-      ...prev,
-      start_hz: toFiniteNumber(microwaveConfig.sweep_start_hz, prev.start_hz),
-      stop_hz: toFiniteNumber(microwaveConfig.sweep_stop_hz, prev.stop_hz),
-      points: toFiniteNumber(microwaveConfig.sweep_points, prev.points),
-      dwell_ms: toFiniteNumber(microwaveConfig.dwell_ms, prev.dwell_ms),
-    }));
-    notifications.show({ color: "teal", title: "已同步", message: "已导入微波页的扫频窗口与驻留时间" });
+    setOdmrForm((prev) =>
+      patchOdmrSweepFields(prev, {
+        start_hz: toFiniteNumber(microwaveConfig.sweep_start_hz, prev.start_hz),
+        stop_hz: toFiniteNumber(microwaveConfig.sweep_stop_hz, prev.stop_hz),
+        step_hz: toFiniteNumber(
+          microwaveConfig.sweep_step_hz,
+          deriveStepHz(
+            microwaveConfig.sweep_start_hz,
+            microwaveConfig.sweep_stop_hz,
+            microwaveConfig.sweep_points,
+            prev.step_hz || DEFAULT_FREQ_STEP_HZ
+          )
+        ),
+        dwell_ms: toFiniteNumber(microwaveConfig.dwell_ms, prev.dwell_ms),
+      })
+    );
+    notifications.show({
+      color: "teal",
+      title: "已同步",
+      message: "已导入微波页的扫频窗口、步进与驻留时间（点数已重算）",
+    });
   };
 
   const syncReadoutFromLockin = () => {
@@ -782,8 +835,8 @@ export default function OdmrPage() {
   };
 
   const syncSensitivityFromOdmr = () => {
-    const startHz = toFiniteNumber(odmrForm.start_hz, 2.83e9);
-    const stopHz = toFiniteNumber(odmrForm.stop_hz, 2.91e9);
+    const startHz = toFiniteNumber(odmrForm.start_hz, DEFAULT_FREQ_START_HZ);
+    const stopHz = toFiniteNumber(odmrForm.stop_hz, DEFAULT_FREQ_STOP_HZ);
     setSensitivityForm((prev) => ({
       ...prev,
       search_center_hz: (startHz + stopHz) / 2,
@@ -983,19 +1036,41 @@ export default function OdmrPage() {
               <NumberInput
                 label="起始频率 (Hz)"
                 value={odmrForm.start_hz}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, start_hz: toFiniteNumber(value, prev.start_hz) }))}
+                onChange={(value) =>
+                  setOdmrForm((prev) =>
+                    patchOdmrSweepFields(prev, { start_hz: toFiniteNumber(value, prev.start_hz) })
+                  )
+                }
               />
               <NumberInput
                 label="终止频率 (Hz)"
                 value={odmrForm.stop_hz}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, stop_hz: toFiniteNumber(value, prev.stop_hz) }))}
+                onChange={(value) =>
+                  setOdmrForm((prev) =>
+                    patchOdmrSweepFields(prev, { stop_hz: toFiniteNumber(value, prev.stop_hz) })
+                  )
+                }
               />
               <NumberInput
-                label="点数"
-                value={odmrForm.points}
+                label="扫频步进 δf (Hz)"
+                description="默认 10000（10 kHz）"
+                value={odmrForm.step_hz}
+                min={1}
+                step={1000}
                 onChange={(value) =>
-                  setOdmrForm((prev) => ({ ...prev, points: Math.max(3, Math.round(toFiniteNumber(value, prev.points))) }))
+                  setOdmrForm((prev) =>
+                    patchOdmrSweepFields(prev, {
+                      step_hz: Math.max(1, toFiniteNumber(value, prev.step_hz || DEFAULT_FREQ_STEP_HZ)),
+                    })
+                  )
                 }
+              />
+              <NumberInput
+                label="点数（自动计算）"
+                description={`N = round((终点−起点)/步进)+1 | ${formatStepHz(odmrForm.step_hz)}`}
+                value={odmrForm.points}
+                readOnly
+                disabled
               />
               <NumberInput
                 label="驻留时间 (ms)"

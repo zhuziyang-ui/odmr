@@ -14,6 +14,13 @@ import { CurrentTrackingPanel } from "../components/CurrentTrackingPanel";
 import { MetricCard } from "../components/MetricCard";
 import { SectionCard } from "../components/SectionCard";
 import { useDashboard } from "../hooks/useDashboard";
+import {
+  DEFAULT_FREQ_START_HZ,
+  DEFAULT_FREQ_STEP_HZ,
+  DEFAULT_FREQ_STOP_HZ,
+  computeLinearSweepPoints,
+  deriveStepHz,
+} from "../lib/sweep";
 
 const PHYSICAL_CALIBRATION_STORAGE_KEY = "nv-current-physical-calibration-v3";
 const LEGACY_CURRENT_STORAGE_KEY = "nv-current-measurement-state-v2";
@@ -130,25 +137,24 @@ function fitPhysicalCalibration(points) {
 function createDefaultCurrentForm(measurement, activeChannel) {
   const tracking = measurement?.last_current_tracking_request || {};
   const legacy = measurement?.last_current_request || {};
+  const startHz = toFiniteNumber(tracking.start_hz ?? legacy.start_hz, DEFAULT_FREQ_START_HZ);
+  const stopHz = toFiniteNumber(tracking.stop_hz ?? legacy.stop_hz, DEFAULT_FREQ_STOP_HZ);
+  const legacyPoints = tracking.search_points ?? legacy.search_points;
+  const stepHz = toFiniteNumber(
+    tracking.search_step_hz ?? legacy.search_step_hz,
+    deriveStepHz(startHz, stopHz, legacyPoints, DEFAULT_FREQ_STEP_HZ)
+  );
+  const calc = computeLinearSweepPoints(startHz, stopHz, stepHz, 11);
   return {
     channel_index: toFiniteNumber(
       tracking.channel_index ?? legacy.channel_index,
       activeChannel
     ),
-    start_hz: toFiniteNumber(
-      tracking.start_hz ?? legacy.start_hz,
-      2.83e9
-    ),
-    stop_hz: toFiniteNumber(
-      tracking.stop_hz ?? legacy.stop_hz,
-      2.91e9
-    ),
-    search_points: Math.max(
-      11,
-      Math.round(
-        toFiniteNumber(tracking.search_points ?? legacy.search_points, 121)
-      )
-    ),
+    // 起止 + 步进(默认 10 kHz) → 自动算点数
+    start_hz: startHz,
+    stop_hz: stopHz,
+    search_step_hz: stepHz,
+    search_points: calc.points ?? 42001,
     settle_ms: Math.max(
       0.1,
       toFiniteNumber(
@@ -273,21 +279,45 @@ export default function CurrentPage() {
     const odmrRequest = measurement.last_request || {};
     setCurrentForm((previous) => ({
       ...previous,
-      start_hz: toFiniteNumber(odmrRequest.start_hz, 2.83e9),
-      stop_hz: toFiniteNumber(odmrRequest.stop_hz, 2.91e9),
+      start_hz: toFiniteNumber(odmrRequest.start_hz, DEFAULT_FREQ_START_HZ),
+      stop_hz: toFiniteNumber(odmrRequest.stop_hz, DEFAULT_FREQ_STOP_HZ),
+      search_step_hz: toFiniteNumber(
+        odmrRequest.step_hz,
+        deriveStepHz(
+          odmrRequest.start_hz,
+          odmrRequest.stop_hz,
+          odmrRequest.points,
+          DEFAULT_FREQ_STEP_HZ
+        )
+      ),
+      search_points:
+        computeLinearSweepPoints(
+          toFiniteNumber(odmrRequest.start_hz, DEFAULT_FREQ_START_HZ),
+          toFiniteNumber(odmrRequest.stop_hz, DEFAULT_FREQ_STOP_HZ),
+          toFiniteNumber(odmrRequest.step_hz, DEFAULT_FREQ_STEP_HZ),
+          11
+        ).points ?? previous.search_points,
     }));
     notifications.show({
       color: "teal",
       title: "已同步",
-      message: "已继承当前 ODMR 的扫描窗口。",
+      message: "已继承当前 ODMR 的扫描窗口与步进（点数已重算）。",
     });
   };
 
   const useDefaultResonance = () => {
+    const calc = computeLinearSweepPoints(
+      DEFAULT_FREQ_START_HZ,
+      DEFAULT_FREQ_STOP_HZ,
+      DEFAULT_FREQ_STEP_HZ,
+      11
+    );
     setCurrentForm((previous) => ({
       ...previous,
-      start_hz: 2.83e9,
-      stop_hz: 2.91e9,
+      start_hz: DEFAULT_FREQ_START_HZ,
+      stop_hz: DEFAULT_FREQ_STOP_HZ,
+      search_step_hz: DEFAULT_FREQ_STEP_HZ,
+      search_points: calc.points ?? 42001,
     }));
   };
 

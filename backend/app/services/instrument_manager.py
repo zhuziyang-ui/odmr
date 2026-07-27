@@ -1886,9 +1886,24 @@ class InstrumentManager:
         }
 
     def update_microwave(self, request: MicrowaveConfigRequest) -> dict[str, Any]:
-        self.microwave_state["config"] = request.model_dump()
+        # request 已由 schema 根据 start/stop/step 重算 sweep_points
+        config = request.model_dump()
+        effective_step_hz = request.effective_sweep_step_hz
+        config["effective_sweep_step_hz"] = effective_step_hz
+        self.microwave_state["config"] = config
         notes: list[str] = []
         errors: list[str] = []
+        instrument_synced = False
+
+        if request.mode == "sweep":
+            notes.append(
+                f"扫频 {request.sweep_start_hz:.0f}–{request.sweep_stop_hz:.0f} Hz, "
+                f"步进={request.sweep_step_hz:.3g} Hz, "
+                f"点数={request.sweep_points} "
+                f"(仪器有效步进≈{effective_step_hz:.6g} Hz)"
+            )
+        else:
+            notes.append(f"定频 {request.frequency_hz:.0f} Hz")
 
         if self.microwave_resource is not None:
             frequency_commands = (
@@ -1911,7 +1926,8 @@ class InstrumentManager:
             if not self._microwave_apply_commands(frequency_commands, errors):
                 self._microwave_mark_io_failure(errors[0])
                 return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("frequency")
+            notes.append("frequency→Keysight")
+            instrument_synced = True
 
             if not self._microwave_apply_commands([f":POW {request.power_dbm}"], errors):
                 self._microwave_mark_io_failure(errors[0])
@@ -1956,15 +1972,19 @@ class InstrumentManager:
                 self._microwave_mark_io_failure(errors[0])
                 return {"success": False, "message": errors[0], "data": self.microwave_state}
             notes.append("lf_output")
+        else:
+            notes.append("微波源未连接，仅更新后端状态（未下发 SCPI）")
 
-        note_text = ", ".join(notes) if notes else "当前只更新后端状态。"
+        note_text = "; ".join(notes)
         self.microwave_state["last_error"] = "; ".join(errors)
         if errors:
             note_text = f"{note_text} | debug: {errors[0]}"
         self._log(
             f"微波参数已更新: mode={request.mode}, "
-            f"power={request.power_dbm:.1f} dBm, fm={'on' if request.fm_enabled else 'off'}, "
-            f"lf_out={'on' if request.lf_output_enabled else 'off'}"
+            f"sweep={request.sweep_start_hz:.0f}-{request.sweep_stop_hz:.0f} Hz, "
+            f"step={request.sweep_step_hz:.3g} Hz, points={request.sweep_points}, "
+            f"power={request.power_dbm:.1f} dBm, "
+            f"synced={'yes' if instrument_synced else 'no'}"
         )
         return {
             "success": True,
