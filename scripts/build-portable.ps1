@@ -1,6 +1,6 @@
 # Build a USB-friendly portable package:
 #   dist-portable/ODMR_Console/
-#     双击启动.bat / 停止.bat
+#     START.bat / STOP.bat / README.txt   (ASCII names only, no CJK filenames)
 #     runtime/python/   (embeddable CPython + site-packages)
 #     app/              (backend + frontend/dist)
 #
@@ -219,8 +219,6 @@ if not "%EC%"=="0" (
 )
 exit /b %EC%
 '@
-Set-Content -Path (Join-Path $OutRoot "双击启动.bat") -Value $StartBat -Encoding ascii
-
 $StopBat = @'
 @echo off
 setlocal EnableExtensions
@@ -232,44 +230,51 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') d
 echo Done.
 pause
 '@
-Set-Content -Path (Join-Path $OutRoot "停止.bat") -Value $StopBat -Encoding ascii
-
-# Also English names for non-Chinese systems
+# ASCII-only filenames (avoid mojibake on USB / other code pages)
 Set-Content -Path (Join-Path $OutRoot "START.bat") -Value $StartBat -Encoding ascii
 Set-Content -Path (Join-Path $OutRoot "STOP.bat") -Value $StopBat -Encoding ascii
 
 $Readme = @"
-ODMR / NV Measurement Console — 便携版（免安装）
-================================================
+ODMR / NV Measurement Console - Portable (no install)
+=====================================================
 
-本文件夹可直接拷到 U 盘，在另一台 Windows 10/11 64 位电脑上使用。
+Copy this whole folder to another Windows 10/11 x64 PC (preferably to local disk).
 
-【使用】
-1. 整夹复制到对方电脑硬盘（推荐，比直接在 U 盘上跑更稳）
-2. 双击「双击启动.bat」或 START.bat
-3. 浏览器自动打开 http://127.0.0.1:8000/
-4. 结束：关闭黑色窗口，或双击「停止.bat」
+How to use
+----------
+1. Copy the entire ODMR_Console folder (not only the .bat files).
+2. Double-click START.bat
+3. Browser opens http://127.0.0.1:8000/
+4. To stop: close the black window, or run STOP.bat
 
-【无需安装】
-- 不需要安装 Python
-- 不需要安装 Node.js
-- 不需要 npm
+No need to install
+------------------
+- Python
+- Node.js / npm
 
-【注意】
-- 仅支持 64 位 Windows
-- 首次杀毒软件可能拦截 python.exe，请允许
-- 连接 Zurich / Keysight 真机时，对方电脑仍需厂商驱动 / VISA（与是否便携无关）
-- 不要只拷 bat，必须拷整个 ODMR_Console 文件夹
+Notes
+-----
+- Windows 10/11 64-bit only
+- Antivirus may block python.exe the first time; allow it
+- Real Zurich / Keysight instruments still need vendor drivers / VISA
+- File names are English-only to avoid encoding issues on USB sticks
 
-打包机 Python embed: $UsedUrl
-生成时间: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Embed package used: $UsedUrl
+Built at: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+(Chinese summary)
+把整个 ODMR_Console 文件夹拷到对方电脑，双击 START.bat 即可。
+无需安装 Python / Node。结束用 STOP.bat 或关闭黑窗口。
 "@
-Set-Content -Path (Join-Path $OutRoot "使用说明.txt") -Value $Readme -Encoding UTF8
+# UTF-8 with BOM helps Notepad on Chinese Windows; filename stays ASCII
+$ReadmePath = Join-Path $OutRoot "README.txt"
+$Utf8Bom = New-Object System.Text.UTF8Encoding $true
+[System.IO.File]::WriteAllText($ReadmePath, $Readme, $Utf8Bom)
 
 Write-Host ""
 Write-Host "=== DONE ===" -ForegroundColor Green
 Write-Host "Portable folder:"
 Write-Host "  $OutRoot"
 Write-Host ""
-Write-Host "Copy the whole ODMR_Console folder to USB, then double-click 双击启动.bat"
+Write-Host "Copy the whole ODMR_Console folder to USB, then double-click START.bat"
 Write-Host ""

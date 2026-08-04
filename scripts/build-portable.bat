@@ -12,6 +12,6 @@ if not "%EC%"=="0" (
 )
 echo.
 echo Output: dist-portable\ODMR_Console\
-echo Copy that folder to USB and double-click 双击启动.bat
+echo Copy that folder to USB and double-click START.bat
 if /I not "%~1"=="silent" pause
 exit /b 0
