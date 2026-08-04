@@ -5,11 +5,13 @@
 ## 对方怎么用（最终用户）
 
 1. 把整个 `ODMR_Console` 文件夹拷到对方电脑（建议拷到硬盘，例如桌面）。  
-2. 双击 **`双击启动.bat`**（或 `START.bat`）。  
+2. 双击 **`START.bat`**。  
 3. 浏览器会打开：http://127.0.0.1:8000/  
-4. 结束：关掉黑色命令行窗口，或双击 **`停止.bat`**。
+4. 结束：关掉黑色命令行窗口，或双击 **`STOP.bat`**。
 
 **不要**只拷 bat 文件；必须整夹包含 `runtime\` 与 `app\`。
+
+> 包内文件名全部为 **英文 ASCII**（`START.bat` / `STOP.bat` / `README.txt`），避免 U 盘/系统代码页导致中文名乱码。
 
 | 要求 | 说明 |
 | --- | --- |
@@ -45,13 +47,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 
 ```text
 dist-portable\ODMR_Console\
-  双击启动.bat
-  停止.bat
-  START.bat
-  STOP.bat
-  使用说明.txt
-  runtime\python\     ← 嵌入式 Python + 已装依赖
-  app\                ← 后端源码 + frontend/dist
+  START.bat           ← double-click to run
+  STOP.bat            ← free port 8000
+  README.txt          ← usage notes
+  runtime\python\     ← embeddable Python + deps
+  app\                ← backend + frontend/dist
 ```
 
 把 **`ODMR_Console` 整夹** 拷进 U 盘即可。
@@ -116,11 +116,11 @@ python main.py
 
 ### 双击后窗口一闪就关
 
-用 `cmd` 进入文件夹运行 `双击启动.bat` 看报错。常见原因：只拷了部分文件、被杀毒删除了 `runtime\python`。
+用 `cmd` 进入文件夹运行 `START.bat` 看报错。常见原因：只拷了部分文件、被杀毒删除了 `runtime\python`。
 
 ### 端口 8000 被占用
 
-先运行 `停止.bat`，或关掉占用 8000 的程序。
+先运行 `STOP.bat`，或关掉占用 8000 的程序。
 
 ### 对方无法连仪器
 
@@ -136,7 +136,7 @@ python main.py
 
 ```text
 [ ] scripts\build-portable.bat 成功
-[ ] dist-portable\ODMR_Console\双击启动.bat 能开浏览器
+[ ] dist-portable\ODMR_Console\START.bat 能开浏览器
 [ ] 页面 /device /current /docs 正常
 [ ] 整夹拷到另一路径再启动仍正常（测“可移动”）
 ```
