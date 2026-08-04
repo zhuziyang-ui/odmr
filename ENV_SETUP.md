@@ -8,7 +8,8 @@
 
 > 硬件仪器（Zurich Instruments 锁相、Keysight 微波源等）**不是**跑通软件的必要条件。无仪器时可用模拟/离线模式开发与自检；接真机时再安装厂商驱动与 VISA。
 
-> **电脑完全不能上网？** 请改看 **[OFFLINE_SETUP.md](./OFFLINE_SETUP.md)**（U 盘打包 / 离线 pip·npm 安装）。
+> **电脑完全不能上网？** 请改看 **[OFFLINE_SETUP.md](./OFFLINE_SETUP.md)**（U 盘打包 / 离线 pip·npm 安装）。  
+> **想免安装、U 盘双击即用？** 请看 **[PORTABLE.md](./PORTABLE.md)**（打成 `ODMR_Console` 便携夹）。
 
 ---
 
