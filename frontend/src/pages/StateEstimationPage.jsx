@@ -26,6 +26,14 @@ import { PlotCard } from "../components/PlotCard";
 import { SectionCard } from "../components/SectionCard";
 import { useDashboard } from "../hooks/useDashboard";
 import { api, wsUrl } from "../lib/api";
+import {
+  DEFAULT_FREQ_START_HZ,
+  DEFAULT_FREQ_STEP_HZ,
+  DEFAULT_FREQ_STOP_HZ,
+  computeLinearSweepPoints,
+  deriveStepHz,
+  formatStepHz,
+} from "../lib/sweep";
 
 const CALIBRATION_STORAGE_KEY = "nv-current-physical-calibration-v3";
 const FORM_STORAGE_KEY = "nv-state-estimation-form-v1";
@@ -68,11 +76,13 @@ function persistPlotWindowSeconds(seconds) {
 }
 
 const DEFAULT_FORM = {
+  // 起止 + 步进(默认 10 kHz) → 自动算点数
   estimator_type: "ekf",
   channel_index: 0,
-  start_hz: 2.83e9,
-  stop_hz: 2.91e9,
-  search_points: 121,
+  start_hz: DEFAULT_FREQ_START_HZ,
+  stop_hz: DEFAULT_FREQ_STOP_HZ,
+  search_step_hz: DEFAULT_FREQ_STEP_HZ,
+  search_points: 42001,
   search_settle_ms: 10,
   tracking_settle_ms: 3,
   sample_averages: 1,
@@ -130,7 +140,27 @@ function loadForm() {
     const saved = JSON.parse(
       window.localStorage.getItem(FORM_STORAGE_KEY) || "{}"
     );
-    return { ...DEFAULT_FORM, ...saved };
+    const merged = { ...DEFAULT_FORM, ...saved };
+    const stepHz =
+      Number(merged.search_step_hz) > 0
+        ? Number(merged.search_step_hz)
+        : deriveStepHz(
+            merged.start_hz,
+            merged.stop_hz,
+            merged.search_points,
+            DEFAULT_FREQ_STEP_HZ
+          );
+    const calc = computeLinearSweepPoints(
+      merged.start_hz,
+      merged.stop_hz,
+      stepHz,
+      11
+    );
+    return {
+      ...merged,
+      search_step_hz: stepHz,
+      search_points: calc.points ?? merged.search_points,
+    };
   } catch {
     return DEFAULT_FORM;
   }
@@ -299,12 +329,56 @@ export default function StateEstimationPage() {
       return;
     }
     const previous = data.measurement.last_state_estimation_request;
-    setForm((current) => ({ ...current, ...previous }));
+    setForm((current) => {
+      const merged = { ...current, ...previous };
+      const stepHz =
+        Number(merged.search_step_hz) > 0
+          ? Number(merged.search_step_hz)
+          : deriveStepHz(
+              merged.start_hz,
+              merged.stop_hz,
+              merged.search_points,
+              DEFAULT_FREQ_STEP_HZ
+            );
+      const calc = computeLinearSweepPoints(
+        merged.start_hz,
+        merged.stop_hz,
+        stepHz,
+        11
+      );
+      return {
+        ...merged,
+        search_step_hz: stepHz,
+        search_points: calc.points ?? merged.search_points,
+      };
+    });
     hydratedFromBackendRef.current = true;
   }, [data?.measurement?.last_state_estimation_request]);
 
+  const patchSearchSweep = (changes) => {
+    setForm((current) => {
+      const next = { ...current, ...changes };
+      const stepHz =
+        Number(next.search_step_hz) > 0
+          ? Number(next.search_step_hz)
+          : DEFAULT_FREQ_STEP_HZ;
+      next.search_step_hz = stepHz;
+      const calc = computeLinearSweepPoints(next.start_hz, next.stop_hz, stepHz, 11);
+      if (calc.points != null) {
+        next.search_points = calc.points;
+      }
+      return next;
+    });
+  };
+
   const updateNumber = (field, minimum = undefined) => (value) => {
     const numeric = finite(value, form[field]);
+    if (field === "start_hz" || field === "stop_hz" || field === "search_step_hz") {
+      patchSearchSweep({
+        [field]: minimum === undefined ? numeric : Math.max(minimum, numeric),
+      });
+      return;
+    }
     setForm((current) => ({
       ...current,
       [field]:
@@ -345,11 +419,21 @@ export default function StateEstimationPage() {
       });
       return;
     }
-    if (form.stop_hz <= form.start_hz) {
+    const searchStepHz =
+      Number(form.search_step_hz) > 0
+        ? Number(form.search_step_hz)
+        : DEFAULT_FREQ_STEP_HZ;
+    const calc = computeLinearSweepPoints(
+      form.start_hz,
+      form.stop_hz,
+      searchStepHz,
+      11
+    );
+    if (calc.error) {
       notifications.show({
         color: "red",
         title: "扫频范围无效",
-        message: "终止频率必须大于起始频率。",
+        message: calc.error,
       });
       return;
     }
@@ -358,7 +442,7 @@ export default function StateEstimationPage() {
     terminalRef.current = false;
     setRunning(true);
     setPhase("FULL_SCAN");
-    setStatus("正在建立 WebSocket...");
+    setStatus(`正在建立 WebSocket...（搜索 ${calc.points} 点）`);
     setLatestPoint(null);
     setHistory([]);
     setScanTrace([]);
@@ -370,6 +454,8 @@ export default function StateEstimationPage() {
       socket.send(
         JSON.stringify({
           ...form,
+          search_step_hz: searchStepHz,
+          search_points: calc.points,
           calibration_slope_a_per_hz: calibration.slope_a_per_hz,
           calibration_intercept_a: calibration.intercept_a,
           calibration_delta_f_min_hz: calibration.delta_f_min_hz,
@@ -691,12 +777,22 @@ export default function StateEstimationPage() {
           </Grid.Col>
           <Grid.Col span={{ base: 12, md: 3 }}>
             <NumberInput
-              label="完整扫频点数"
-              value={form.search_points}
-              min={11}
-              step={2}
-              onChange={updateNumber("search_points", 11)}
+              label="搜索步进 δf (Hz)"
+              description="默认 10000（10 kHz）"
+              value={form.search_step_hz ?? DEFAULT_FREQ_STEP_HZ}
+              min={1}
+              step={1000}
+              onChange={updateNumber("search_step_hz", 1)}
               disabled={running}
+            />
+          </Grid.Col>
+          <Grid.Col span={{ base: 12, md: 3 }}>
+            <NumberInput
+              label="完整扫频点数（自动）"
+              description={`步进 ${formatStepHz(form.search_step_hz ?? DEFAULT_FREQ_STEP_HZ)}`}
+              value={form.search_points}
+              disabled
+              readOnly
             />
           </Grid.Col>
           <Grid.Col span={{ base: 12, md: 3 }}>

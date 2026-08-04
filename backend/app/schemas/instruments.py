@@ -4,6 +4,64 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# Shared linear-sweep defaults (start/stop/step → points). Used by state estimation
+# and optional clients that compute N = round((stop - start) / step) + 1.
+DEFAULT_FREQ_START_HZ = 2.68e9
+DEFAULT_FREQ_STOP_HZ = 3.10e9
+DEFAULT_FREQ_STEP_HZ = 10_000.0
+MAX_LINEAR_SWEEP_POINTS = 100_001
+
+
+def fill_step_from_points_dict(
+    data: Any,
+    *,
+    start_key: str,
+    stop_key: str,
+    step_key: str,
+    points_key: str,
+    default_start: float = DEFAULT_FREQ_START_HZ,
+    default_stop: float = DEFAULT_FREQ_STOP_HZ,
+) -> Any:
+    """Legacy payloads with only points: back-fill step from start/stop/points."""
+    if not isinstance(data, dict):
+        return data
+    if data.get(step_key) is not None:
+        return data
+    start = float(data.get(start_key, default_start))
+    stop = float(data.get(stop_key, default_stop))
+    points = data.get(points_key)
+    if points is not None and int(points) > 1 and stop > start:
+        data = dict(data)
+        data[step_key] = (stop - start) / (int(points) - 1)
+    return data
+
+
+def resolve_points_from_step(
+    start_hz: float,
+    stop_hz: float,
+    step_hz: float,
+    *,
+    min_points: int = 2,
+    max_points: int = MAX_LINEAR_SWEEP_POINTS,
+    label: str = "扫频",
+) -> int:
+    """N = round((stop - start) / step) + 1."""
+    span = float(stop_hz) - float(start_hz)
+    if span <= 0:
+        raise ValueError(f"{label}终点频率必须大于起点频率。")
+    step = float(step_hz)
+    if step <= 0:
+        raise ValueError(f"{label}步进必须大于 0。")
+    points = int(round(span / step)) + 1
+    if points < min_points:
+        points = min_points
+    if points > max_points:
+        raise ValueError(
+            f"{label}步进过小导致点数 {points} 超过上限 {max_points}。"
+            f"请增大步进或缩小跨度。"
+        )
+    return points
+
 
 class LabOneServerConfig(BaseModel):
     server_host: str = "localhost"

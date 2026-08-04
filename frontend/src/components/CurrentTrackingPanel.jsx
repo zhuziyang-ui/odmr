@@ -15,6 +15,11 @@ import {
 import { notifications } from "@mantine/notifications";
 
 import { api, formatGHz, wsUrl } from "../lib/api";
+import {
+  DEFAULT_FREQ_STEP_HZ,
+  computeLinearSweepPoints,
+  formatStepHz,
+} from "../lib/sweep";
 import { MetricCard } from "./MetricCard";
 import { PlotCard } from "./PlotCard";
 import { SectionCard } from "./SectionCard";
@@ -640,13 +645,34 @@ export function CurrentTrackingPanel({
 
     socket.onopen = () => {
       setIsTracking(true);
+      const searchStepHz = Number(currentForm.search_step_hz) > 0
+        ? Number(currentForm.search_step_hz)
+        : DEFAULT_FREQ_STEP_HZ;
+      const calc = computeLinearSweepPoints(
+        currentForm.start_hz,
+        currentForm.stop_hz,
+        searchStepHz,
+        11
+      );
+      if (calc.error) {
+        notifications.show({
+          color: "red",
+          title: "搜索扫频参数无效",
+          message: calc.error,
+        });
+        closeSocket();
+        setIsTracking(false);
+        setLockState("idle");
+        return;
+      }
       socket.send(
         JSON.stringify({
           ...form,
           channel_index: currentForm.channel_index,
           start_hz: currentForm.start_hz,
           stop_hz: currentForm.stop_hz,
-          search_points: currentForm.search_points,
+          search_step_hz: searchStepHz,
+          search_points: calc.points,
           search_settle_ms: currentForm.settle_ms,
           minimum_calibration_slope_a_per_hz:
             minimumCalibration?.slope_a_per_hz ?? null,
@@ -837,6 +863,20 @@ export function CurrentTrackingPanel({
     }
   };
 
+  const patchCurrentSweep = (changes) => {
+    const next = { ...currentForm, ...changes };
+    const stepHz =
+      Number(next.search_step_hz) > 0
+        ? Number(next.search_step_hz)
+        : DEFAULT_FREQ_STEP_HZ;
+    next.search_step_hz = stepHz;
+    const calc = computeLinearSweepPoints(next.start_hz, next.stop_hz, stepHz, 11);
+    if (calc.points != null) {
+      next.search_points = calc.points;
+    }
+    onCurrentFormChange?.(next);
+  };
+
   const updateCurrentNumber = (field, minimum = null, integer = false) => (value) => {
     markConfigDirty();
     const previousValue = currentForm?.[field];
@@ -1021,20 +1061,44 @@ export function CurrentTrackingPanel({
           label="起始频率 (Hz)"
           value={currentForm.start_hz}
           disabled={isTracking}
-          onChange={updateCurrentNumber("start_hz")}
+          onChange={(value) =>
+            patchCurrentSweep({
+              start_hz: Number(value) || currentForm.start_hz,
+            })
+          }
         />
         <NumberInput
           label="终止频率 (Hz)"
           value={currentForm.stop_hz}
           disabled={isTracking}
-          onChange={updateCurrentNumber("stop_hz")}
+          onChange={(value) =>
+            patchCurrentSweep({
+              stop_hz: Number(value) || currentForm.stop_hz,
+            })
+          }
         />
         <NumberInput
-          label="搜索点数"
-          value={currentForm.search_points}
+          label="搜索步进 δf (Hz)"
+          description="默认 10000（10 kHz）"
+          value={currentForm.search_step_hz ?? DEFAULT_FREQ_STEP_HZ}
           disabled={isTracking}
-          min={11}
-          onChange={updateCurrentNumber("search_points", 11, true)}
+          min={1}
+          step={1000}
+          onChange={(value) =>
+            patchCurrentSweep({
+              search_step_hz: Math.max(
+                1,
+                Number(value) || currentForm.search_step_hz || DEFAULT_FREQ_STEP_HZ
+              ),
+            })
+          }
+        />
+        <NumberInput
+          label="搜索点数（自动计算）"
+          description={`步进 ${formatStepHz(currentForm.search_step_hz ?? DEFAULT_FREQ_STEP_HZ)}`}
+          value={currentForm.search_points}
+          disabled
+          readOnly
         />
         <NumberInput
           label="初始扫频稳定等待 (ms)"

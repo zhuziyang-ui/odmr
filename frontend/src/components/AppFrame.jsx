@@ -18,6 +18,7 @@ import {
   IconChartLine,
   IconCpu,
   IconCurrentLocation,
+  IconScale,
   IconTopologyStar3,
 } from "@tabler/icons-react";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -29,6 +30,7 @@ const navItems = [
   { to: "/odmr", label: "ODMR 扫描", subtitle: "两种扫描方式", icon: IconChartLine },
   { to: "/current", label: "电流测量", subtitle: "标定与自动测量", icon: IconCurrentLocation },
   { to: "/state-estimation", label: "状态估计电流", subtitle: "EKF / UKF 双峰预测", icon: IconTopologyStar3 },
+  { to: "/accuracy", label: "准确度映射", subtitle: "GB 0.2/0.2S · δf→δI", icon: IconScale },
 ];
 
 function Sidebar({ onNavigate }) {
@@ -91,7 +93,7 @@ function Sidebar({ onNavigate }) {
             </Text>
           </div>
           <Badge variant="light" color="cyan" size="lg">
-            6 Pages
+            7 Pages
           </Badge>
         </Group>
       </Box>
