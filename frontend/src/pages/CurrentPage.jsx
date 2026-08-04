@@ -269,17 +269,37 @@ export default function CurrentPage() {
   const measurement = data.measurement || {};
   const calibrationModel = fitPhysicalCalibration(calibrationPoints);
 
-  const syncFromOdmr = () => {
-    const odmrRequest = measurement.last_request || {};
+  const syncFromMicrowave = () => {
+    const microwaveConfig = data.microwave?.config || {};
+    const startHz = toFiniteNumber(
+      microwaveConfig.sweep_start_hz,
+      currentForm.start_hz
+    );
+    const stopHz = toFiniteNumber(
+      microwaveConfig.sweep_stop_hz,
+      currentForm.stop_hz
+    );
+    const searchPoints = Math.max(
+      11,
+      Math.round(
+        toFiniteNumber(microwaveConfig.sweep_points, currentForm.search_points)
+      )
+    );
+    const settleMs = Math.max(
+      0.1,
+      toFiniteNumber(microwaveConfig.dwell_ms, currentForm.settle_ms)
+    );
     setCurrentForm((previous) => ({
       ...previous,
-      start_hz: toFiniteNumber(odmrRequest.start_hz, 2.83e9),
-      stop_hz: toFiniteNumber(odmrRequest.stop_hz, 2.91e9),
+      start_hz: startHz,
+      stop_hz: stopHz,
+      search_points: searchPoints,
+      settle_ms: settleMs,
     }));
     notifications.show({
       color: "teal",
-      title: "已同步",
-      message: "已继承当前 ODMR 的扫描窗口。",
+      title: "已从微波页同步",
+      message: `捕获范围 ${(startHz / 1e9).toFixed(4)}–${(stopHz / 1e9).toFixed(4)} GHz，搜索点 ${searchPoints}，驻留 ${settleMs.toFixed(1)} ms`,
     });
   };
 
@@ -437,7 +457,7 @@ export default function CurrentPage() {
       <CurrentTrackingPanel
         currentForm={currentForm}
         onCurrentFormChange={setCurrentForm}
-        onSyncFromOdmr={syncFromOdmr}
+        onSyncFromMicrowave={syncFromMicrowave}
         onUseDefaultResonance={useDefaultResonance}
         calibrationPoints={calibrationPoints}
         onAddPhysicalCalibrationPoint={addPhysicalCalibrationPoint}

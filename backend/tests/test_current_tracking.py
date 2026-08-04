@@ -18,6 +18,19 @@ class CurrentTrackingRequestTests(unittest.TestCase):
         self.assertTrue(request.record_enabled)
         self.assertEqual(request.record_interval_s, 1.0)
 
+    def test_defaults_match_robust_sensitivity_preset(self) -> None:
+        """Backend defaults follow the 稳健 preset (noise tolerance only)."""
+        request = CurrentTrackingRequest()
+        self.assertEqual(request.bad_samples_to_suspect, 3)
+        self.assertEqual(request.bad_samples_to_lose, 6)
+        self.assertEqual(request.good_samples_to_lock, 2)
+        self.assertAlmostEqual(request.minimum_complex_fit_r2, 0.5)
+        self.assertAlmostEqual(request.peak_pair_ambiguity_score_ratio, 0.75)
+        self.assertAlmostEqual(request.minimum_peak_prominence_fraction, 0.03)
+        self.assertEqual(request.max_relock_attempts, 10)
+        self.assertAlmostEqual(request.tracking_settle_ms, 5.0)
+        self.assertAlmostEqual(request.search_settle_ms, 15.0)
+
     def test_legacy_r_or_zero_crossing_target_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             CurrentTrackingRequest(tracking_target="minimum")

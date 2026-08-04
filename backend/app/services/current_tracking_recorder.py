@@ -187,6 +187,10 @@ class CurrentTrackingRecorder:
         self.next_deadline_s: float | None = None
         self.closed = False
         self.last_export_error = ""
+        self.error_message = ""
+        self.failed_stage = ""
+        self.error_code = ""
+        self.error_hint = ""
         self._file = self.csv_path.open("w", newline="", encoding="utf-8-sig")
         self._writer = csv.DictWriter(self._file, fieldnames=DATA_COLUMNS)
         self._writer.writeheader()
@@ -210,6 +214,10 @@ class CurrentTrackingRecorder:
                 str(self.xlsx_path.resolve()) if self.xlsx_path.exists() else None
             ),
             "last_export_error": self.last_export_error,
+            "error_message": self.error_message,
+            "failed_stage": self.failed_stage,
+            "error_code": self.error_code,
+            "error_hint": self.error_hint,
             "request": self.request_snapshot,
             "devices": self.device_snapshot,
         }
@@ -383,7 +391,15 @@ class CurrentTrackingRecorder:
                 self.next_deadline_s += self.interval_s
             return True
 
-    def finalize(self, status: str) -> dict[str, Any]:
+    def finalize(
+        self,
+        status: str,
+        *,
+        error_message: str = "",
+        failed_stage: str = "",
+        error_code: str = "",
+        error_hint: str = "",
+    ) -> dict[str, Any]:
         with self.lock:
             if not self.closed:
                 if self.pending_points:
@@ -392,6 +408,14 @@ class CurrentTrackingRecorder:
                     )
                     self.pending_points.clear()
                 self.status = str(status)
+                if error_message:
+                    self.error_message = str(error_message)
+                if failed_stage:
+                    self.failed_stage = str(failed_stage)
+                if error_code:
+                    self.error_code = str(error_code)
+                if error_hint:
+                    self.error_hint = str(error_hint)
                 self.ended_at = datetime.now().astimezone().isoformat(
                     timespec="milliseconds"
                 )
@@ -718,11 +742,29 @@ class CurrentTrackingRecordingManager:
         wrote = recorder.add_point(point)
         return wrote, recorder.status_dict() if wrote else None
 
-    def finish(self, status: str) -> dict[str, Any] | None:
+    def finish(
+        self,
+        status: str,
+        *,
+        error_message: str = "",
+        failed_stage: str = "",
+        error_code: str = "",
+        error_hint: str = "",
+    ) -> dict[str, Any] | None:
         with self.lock:
             recorder = self.active
             self.active = None
-        return recorder.finalize(status) if recorder is not None else None
+        return (
+            recorder.finalize(
+                status,
+                error_message=error_message,
+                failed_stage=failed_stage,
+                error_code=error_code,
+                error_hint=error_hint,
+            )
+            if recorder is not None
+            else None
+        )
 
     def status(self, session_id: str | None = None) -> dict[str, Any]:
         with self.lock:

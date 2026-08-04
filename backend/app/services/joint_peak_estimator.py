@@ -603,7 +603,8 @@ class JointPeakStateEstimator:
             if self.current_calibrated
             else None
         )
-        confidence_multiplier_95 = 1.959963984540054
+        # Normal two-sided z for 99% CI (Φ^{-1}(0.995)).
+        confidence_multiplier_99 = 2.5758293035489004
         f_left_hz = float(self.x[self.F_LEFT])
         f_right_hz = float(self.x[self.F_RIGHT])
         f_left_sigma_hz = self.peak_frequency_sigma_hz("left")
@@ -623,23 +624,23 @@ class JointPeakStateEstimator:
             "f_right_sigma_hz": f_right_sigma_hz,
             "splitting_sigma_hz": sigma_delta_hz,
             "current_sigma_a": current_sigma_a,
-            "confidence_level": 0.95,
-            "f_left_ci95_hz": [
-                f_left_hz - confidence_multiplier_95 * f_left_sigma_hz,
-                f_left_hz + confidence_multiplier_95 * f_left_sigma_hz,
+            "confidence_level": 0.99,
+            "f_left_ci99_hz": [
+                f_left_hz - confidence_multiplier_99 * f_left_sigma_hz,
+                f_left_hz + confidence_multiplier_99 * f_left_sigma_hz,
             ],
-            "f_right_ci95_hz": [
-                f_right_hz - confidence_multiplier_95 * f_right_sigma_hz,
-                f_right_hz + confidence_multiplier_95 * f_right_sigma_hz,
+            "f_right_ci99_hz": [
+                f_right_hz - confidence_multiplier_99 * f_right_sigma_hz,
+                f_right_hz + confidence_multiplier_99 * f_right_sigma_hz,
             ],
-            "splitting_ci95_hz": [
-                splitting_hz - confidence_multiplier_95 * sigma_delta_hz,
-                splitting_hz + confidence_multiplier_95 * sigma_delta_hz,
+            "splitting_ci99_hz": [
+                splitting_hz - confidence_multiplier_99 * sigma_delta_hz,
+                splitting_hz + confidence_multiplier_99 * sigma_delta_hz,
             ],
-            "current_ci95_a": (
+            "current_ci99_a": (
                 [
-                    current_a - confidence_multiplier_95 * current_sigma_a,
-                    current_a + confidence_multiplier_95 * current_sigma_a,
+                    current_a - confidence_multiplier_99 * current_sigma_a,
+                    current_a + confidence_multiplier_99 * current_sigma_a,
                 ]
                 if current_a is not None and current_sigma_a is not None
                 else None

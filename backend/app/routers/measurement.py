@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -90,14 +91,32 @@ async def odmr_ws(websocket: WebSocket) -> None:
             streamed_values: list[float] = []
             use_live_readout = manager.can_run_live_odmr(request)
             restore_output = bool(manager.microwave_state.get("config", {}).get("output_enabled", False))
+            estimated_dwell_s = manager.estimate_odmr_duration_s(request)
+            scan_t0 = time.perf_counter()
+
+            def _elapsed_s() -> float:
+                return max(0.0, time.perf_counter() - scan_t0)
+
+            def _eta_s(index: int) -> float:
+                if index <= 0:
+                    return float(estimated_dwell_s)
+                elapsed = _elapsed_s()
+                remaining_points = max(0, int(request.points) - int(index))
+                return elapsed / float(index) * remaining_points
 
             async def send_cancelled() -> None:
+                elapsed = _elapsed_s()
+                points_done = len(streamed_values)
                 trace = manager.cancel_odmr_stream_result(request, streamed_freq, streamed_values)
                 await websocket.send_json(
                     {
                         "type": "odmr_cancelled",
                         "trace": trace,
-                        "progress": len(streamed_values) / max(1, request.points),
+                        "progress": points_done / max(1, request.points),
+                        "elapsed_s": elapsed,
+                        "points_done": points_done,
+                        "points": request.points,
+                        "estimated_duration_s": estimated_dwell_s,
                     }
                 )
 
@@ -107,7 +126,9 @@ async def odmr_ws(websocket: WebSocket) -> None:
                     "points": request.points,
                     "scan_mode": request.scan_mode,
                     "readout_source": request.readout_source,
-                    "estimated_duration_s": manager.estimate_odmr_duration_s(request),
+                    "estimated_duration_s": estimated_dwell_s,
+                    "estimated_dwell_s": estimated_dwell_s,
+                    "started_at_unix": time.time(),
                     "live_readout": use_live_readout,
                 }
             )
@@ -115,13 +136,16 @@ async def odmr_ws(websocket: WebSocket) -> None:
                 if use_live_readout:
                     if not manager.set_microwave_output_enabled(True):
                         raise RuntimeError(manager.microwave_state.get("last_error") or "微波输出开启失败。")
+                    # Enter CW once, then only write frequency each point (faster than MODE+FREQ).
+                    if not manager.prepare_microwave_fast_tracking():
+                        raise RuntimeError(manager.microwave_state.get("last_error") or "微波 CW 模式准备失败。")
                 for index, freq in enumerate(frequencies, start=1):
                     if manager.odmr_stop_event.is_set():
                         await send_cancelled()
                         break
 
                     if use_live_readout:
-                        if not manager.set_microwave_frequency(freq):
+                        if not manager.set_microwave_frequency_fast(freq):
                             raise RuntimeError(manager.microwave_state.get("last_error") or "微波频率更新失败。")
                     await asyncio.sleep(manager._odmr_delay_s(request))
                     if manager.odmr_stop_event.is_set():
@@ -138,6 +162,7 @@ async def odmr_ws(websocket: WebSocket) -> None:
                     streamed_freq.append(freq)
                     streamed_values.append(value)
                     manager.update_odmr_progress(request, index, freq, value)
+                    elapsed = _elapsed_s()
                     await websocket.send_json(
                         {
                             "type": "odmr_point",
@@ -149,15 +174,34 @@ async def odmr_ws(websocket: WebSocket) -> None:
                             "readout_source": request.readout_source,
                             "scan_mode": request.scan_mode,
                             "live_readout": use_live_readout,
+                            "elapsed_s": elapsed,
+                            "eta_s": _eta_s(index),
+                            "estimated_duration_s": estimated_dwell_s,
                         }
                     )
                 else:
+                    elapsed = _elapsed_s()
                     trace = manager.finish_odmr_stream(request, streamed_freq, streamed_values)
-                    await websocket.send_json({"type": "odmr_complete", "trace": trace})
+                    await websocket.send_json(
+                        {
+                            "type": "odmr_complete",
+                            "trace": trace,
+                            "elapsed_s": elapsed,
+                            "points_done": len(streamed_values),
+                            "points": request.points,
+                            "estimated_duration_s": estimated_dwell_s,
+                        }
+                    )
             except Exception as exc:
                 manager.measurement_state["running"] = False
                 manager.measurement_state["status"] = "error"
-                await websocket.send_json({"type": "odmr_error", "message": str(exc)})
+                await websocket.send_json(
+                    {
+                        "type": "odmr_error",
+                        "message": str(exc),
+                        "elapsed_s": _elapsed_s(),
+                    }
+                )
             finally:
                 if use_live_readout and manager.microwave_state.get("connected"):
                     manager.set_microwave_output_enabled(restore_output)
@@ -260,12 +304,20 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
     worker: asyncio.Task | None = None
     request: CurrentTrackingRequest | None = None
     try:
+        from backend.app.services.dual_peak_tracker import (
+            CurrentTrackingError,
+            classify_current_tracking_failure,
+        )
+
         payload = await websocket.receive_json()
         if manager.measurement_state.get("running"):
             await websocket.send_json(
                 {
                     "type": "current_tracking_error",
                     "message": "已有测量任务正在运行，请先停止当前任务。",
+                    "failed_stage": "setup",
+                    "error_code": "busy",
+                    "hint": "请先停止当前测量任务后再启动双峰跟踪。",
                 }
             )
             return
@@ -332,15 +384,27 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
             manager.measurement_state["status"] = "cancelled"
         return
     except Exception as exc:
+        from backend.app.services.dual_peak_tracker import (
+            CurrentTrackingError,
+            classify_current_tracking_failure,
+        )
+
         is_cancelled = "已停止" in str(exc)
+        if isinstance(exc, CurrentTrackingError):
+            error_info = exc.as_dict()
+        else:
+            error_info = classify_current_tracking_failure(str(exc))
         if request is not None:
             manager.finish_current_tracking_recording(
-                "cancelled" if is_cancelled else "error"
+                "cancelled" if is_cancelled else "error",
+                error_info=None if is_cancelled else error_info,
             )
         manager.measurement_state["running"] = False
         manager.measurement_state["mode"] = "idle"
         manager.measurement_state["status"] = "cancelled" if is_cancelled else "error"
         manager.measurement_state["cancel_requested"] = False
+        if not is_cancelled:
+            manager.measurement_state["last_current_tracking_error"] = error_info
         try:
             await websocket.send_json(
                 {
@@ -349,7 +413,10 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
                         if is_cancelled
                         else "current_tracking_error"
                     ),
-                    "message": str(exc),
+                    "message": error_info.get("message") or str(exc),
+                    "failed_stage": error_info.get("failed_stage", ""),
+                    "error_code": error_info.get("error_code", ""),
+                    "hint": error_info.get("hint", ""),
                 }
             )
         except Exception:

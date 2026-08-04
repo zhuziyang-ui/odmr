@@ -90,3 +90,13 @@ async def disconnect_microwave() -> dict:
 @router.post("/microwave/config")
 async def update_microwave(request: MicrowaveConfigRequest) -> dict:
     return manager.update_microwave(request)
+
+
+@router.post("/microwave/sweep/trigger")
+async def trigger_microwave_sweep() -> dict:
+    return manager.start_microwave_sweep_trigger()
+
+
+@router.post("/microwave/sweep/stop")
+async def stop_microwave_sweep() -> dict:
+    return manager.stop_microwave_sweep_trigger()

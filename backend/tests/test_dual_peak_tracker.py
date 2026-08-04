@@ -4,6 +4,7 @@ import unittest
 from backend.app.services.dual_peak_simulator import DualPeakSimulator, SimulatedPeak
 from backend.app.services.dual_peak_tracker import (
     ComplexPeakModel,
+    CurrentTrackingError,
     GlobalState,
     MotionEstimate,
     PeakId,
@@ -14,6 +15,7 @@ from backend.app.services.dual_peak_tracker import (
     blend_symmetric_complex_probe,
     calculate_aligned_output,
     calculate_frequency_error,
+    classify_current_tracking_failure,
     find_fm_magnitude_resonances,
     fit_complex_affine_model,
     select_fm_resonance_pair,
@@ -193,6 +195,55 @@ class FmMagnitudeResonanceTests(unittest.TestCase):
             + right.complex_slope.imag * phase.imag,
             0.0,
         )
+
+    def test_center_is_valley_not_lobe_peak(self) -> None:
+        """Peak center must be the minimum between the two R lobes."""
+        frequencies = [float(value) for value in range(0, 401, 1)]
+        phase = complex(1.0, 0.0)
+        complex_values = [
+            phase * self._lorentzian_derivative(frequency, 200.0)
+            for frequency in frequencies
+        ]
+        r_values = [abs(value) for value in complex_values]
+        candidates = find_fm_magnitude_resonances(
+            frequencies,
+            r_values,
+            complex_values,
+            minimum_prominence_fraction=0.03,
+        )
+        self.assertGreaterEqual(len(candidates), 1)
+        best = max(candidates, key=lambda item: item.score)
+        self.assertAlmostEqual(best.center_hz, 200.0, delta=2.0)
+        self.assertLess(best.center_r, best.left_lobe_r)
+        self.assertLess(best.center_r, best.right_lobe_r)
+
+
+class CurrentTrackingFailureClassificationTests(unittest.TestCase):
+    def test_classify_no_two_lobes(self) -> None:
+        info = classify_current_tracking_failure(
+            "完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振。"
+        )
+        self.assertEqual(info["failed_stage"], "full_scan")
+        self.assertEqual(info["error_code"], "no_two_lobes")
+        self.assertIn("双瓣", info["hint"])
+
+    def test_classify_ambiguity(self) -> None:
+        info = classify_current_tracking_failure(
+            "FM 双峰候选组合存在歧义，拒绝猜测峰身份。"
+        )
+        self.assertEqual(info["error_code"], "pair_ambiguous")
+
+    def test_current_tracking_error_as_dict(self) -> None:
+        exc = CurrentTrackingError(
+            "测试",
+            stage="calibrate",
+            code="fit_r2",
+            hint="略降 R²",
+        )
+        payload = exc.as_dict()
+        self.assertEqual(payload["failed_stage"], "calibrate")
+        self.assertEqual(payload["error_code"], "fit_r2")
+        self.assertIsInstance(exc, RuntimeError)
 
 
 class SpecPidTests(unittest.TestCase):

@@ -47,6 +47,7 @@ from backend.app.schemas.instruments import (
     SensitivityRequest,
 )
 from backend.app.services.dual_peak_tracker import (
+    CurrentTrackingError,
     GlobalState,
     PeakId,
     PeakMeasurement,
@@ -57,6 +58,7 @@ from backend.app.services.dual_peak_tracker import (
     blend_symmetric_complex_probe,
     calculate_aligned_output,
     calculate_frequency_error,
+    classify_current_tracking_failure,
     find_fm_magnitude_resonances,
     fit_complex_affine_model,
     select_fm_resonance_pair,
@@ -218,6 +220,8 @@ class InstrumentManager:
         self.sampler_stop_event = threading.Event()
         self.odmr_stop_event = threading.Event()
         self.microwave_lock = threading.RLock()
+        self.microwave_sweep_stop_event = threading.Event()
+        self.microwave_sweep_thread: threading.Thread | None = None
         self.current_tracking_recordings = CurrentTrackingRecordingManager(
             Path(__file__).resolve().parents[3] / "data" / "current_tracking"
         )
@@ -251,6 +255,16 @@ class InstrumentManager:
             "available_resources": [],
             "last_error": "",
             "config": MicrowaveConfigRequest().model_dump(),
+            "sweep_trigger": {
+                "running": False,
+                "status": "idle",
+                "started_at": None,
+                "elapsed_s": 0.0,
+                "estimated_duration_s": 0.0,
+                "points": 0,
+                "dwell_ms": 0.0,
+                "message": "",
+            },
         }
         self.measurement_state: dict[str, Any] = {
             "running": False,
@@ -1866,6 +1880,7 @@ class InstrumentManager:
         return True
 
     def disconnect_microwave(self) -> dict[str, Any]:
+        self.microwave_sweep_stop_event.set()
         resource = self.microwave_resource
         self.microwave_resource = None
         if resource is not None:
@@ -1878,6 +1893,11 @@ class InstrumentManager:
             }
         )
         self.microwave_state["config"]["output_enabled"] = False
+        self._update_sweep_trigger_state(
+            running=False,
+            status="idle",
+            message="微波源已断开",
+        )
         self._log("微波源已断开连接。")
         return {
             "success": True,
@@ -1885,90 +1905,492 @@ class InstrumentManager:
             "data": self.microwave_state,
         }
 
+    @staticmethod
+    def compute_sweep_points(
+        start_hz: float,
+        stop_hz: float,
+        step_hz: float,
+        *,
+        min_points: int = 2,
+        max_points: int = 65535,
+    ) -> dict[str, float | int]:
+        """Derive sweep point count from start/stop/step (Keysight STAR/STOP/POIN style)."""
+        start = float(start_hz)
+        stop = float(stop_hz)
+        step = float(step_hz)
+        if not math.isfinite(start) or not math.isfinite(stop) or not math.isfinite(step):
+            raise ValueError("扫频起点、终点和步进必须是有限数值。")
+        if step <= 0:
+            raise ValueError("扫频步进必须大于 0。")
+        if stop <= start:
+            raise ValueError("扫频终点必须大于起点。")
+
+        span = stop - start
+        points = int(round(span / step)) + 1
+        points = max(min_points, points)
+        if points > max_points:
+            raise ValueError(
+                f"按步进 {step:g} Hz 计算得到 {points} 个扫频点，超过上限 {max_points}。"
+                "请增大步进或缩小扫频范围。"
+            )
+        actual_step_hz = span / (points - 1) if points > 1 else step
+        return {
+            "sweep_points": points,
+            "actual_step_hz": float(actual_step_hz),
+            "requested_step_hz": step,
+            "sweep_start_hz": start,
+            "sweep_stop_hz": stop,
+        }
+
+    def _normalize_microwave_sweep(self, request: MicrowaveConfigRequest) -> MicrowaveConfigRequest:
+        """Recompute sweep_points from step and return an updated request model."""
+        payload = request.model_dump()
+        computed = self.compute_sweep_points(
+            request.sweep_start_hz,
+            request.sweep_stop_hz,
+            request.sweep_step_hz,
+        )
+        payload["sweep_points"] = int(computed["sweep_points"])
+        payload["sweep_step_hz"] = float(computed["requested_step_hz"])
+        return MicrowaveConfigRequest(**payload)
+
     def update_microwave(self, request: MicrowaveConfigRequest) -> dict[str, Any]:
-        self.microwave_state["config"] = request.model_dump()
         notes: list[str] = []
         errors: list[str] = []
 
-        if self.microwave_resource is not None:
-            frequency_commands = (
-                [":FREQ:MODE CW", f":FREQ {request.frequency_hz}"]
-                if request.mode == "cw"
-                else [
-                    ":ABOR",
-                    ":FREQ:MODE LIST",
-                    ":LIST:DWEL:TYPE STEP",
-                    ":TRIG:SOUR IMM",
-                    ":LIST:TRIG:SOUR IMM",
-                    ":LIST:TYPE STEP",
-                    ":INIT:CONT ON",
-                    f":SWE:DWEL {max(request.dwell_ms / 1000.0, 0.005)}",
-                    f":FREQ:STAR {request.sweep_start_hz}",
-                    f":FREQ:STOP {request.sweep_stop_hz}",
-                    f":SWE:POIN {request.sweep_points}",
-                ]
+        try:
+            request = self._normalize_microwave_sweep(request)
+        except ValueError as exc:
+            message = str(exc)
+            self.microwave_state["last_error"] = message
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        config = request.model_dump()
+        self.microwave_state["config"] = config
+        actual_step_hz = (
+            (request.sweep_stop_hz - request.sweep_start_hz) / (request.sweep_points - 1)
+            if request.sweep_points > 1
+            else float(request.sweep_step_hz)
+        )
+
+        if self.microwave_resource is None:
+            message = (
+                "微波源未连接，参数已缓存在后端但未写入 Keysight。"
+                f" 扫频点数={request.sweep_points}，请求步进={request.sweep_step_hz:g} Hz，"
+                f"实际步进≈{actual_step_hz:g} Hz。请先连接微波源后再点「应用当前配置」。"
             )
-            if not self._microwave_apply_commands(frequency_commands, errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("frequency")
+            self.microwave_state["last_error"] = message
+            self._log(message)
+            return {"success": False, "message": message, "data": self.microwave_state}
 
-            if not self._microwave_apply_commands([f":POW {request.power_dbm}"], errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("power")
+        # If a software-managed single-shot trigger is running, stop it before re-arming.
+        sweep_state = self.microwave_state.get("sweep_trigger") or {}
+        if sweep_state.get("running") or (
+            self.microwave_sweep_thread is not None and self.microwave_sweep_thread.is_alive()
+        ):
+            self.microwave_sweep_stop_event.set()
+            self._microwave_apply_commands([":ABOR"], errors)
+            self._update_sweep_trigger_state(
+                running=False,
+                status="cancelled",
+                message="配置变更，已中止进行中的单次扫频",
+            )
 
-            if not self._microwave_apply_commands([f":OUTP {'ON' if request.output_enabled else 'OFF'}"], errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("output")
-
-            if not self._microwave_apply_commands([f":IQ:STAT {'ON' if request.iq_enabled else 'OFF'}"], errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("iq")
-
-            fm_commands: list[str] = []
-            if request.fm_enabled:
-                fm_source = "FUNCTION1" if request.fm_source == "internal" else "EXT1"
-                fm_commands.extend([f":FM:SOUR {fm_source}", f":FM {request.fm_deviation_hz}"])
-                if request.fm_source == "internal" or request.lf_output_source == "monitor":
-                    fm_commands.append(f":FM:INT:FUNC:FREQ {request.fm_rate_hz}")
-            fm_commands.append(f":FM:STAT {'ON' if request.fm_enabled else 'OFF'}")
-            if not self._microwave_apply_commands(fm_commands, errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("fm")
-
-            lf_commands = [
-                f":LFO:LOAD:IMP {request.lf_output_load_ohm}",
-                f":LFO:OFFS {request.lf_output_offset_v}",
-                f":LFO:AMPL {request.lf_output_amplitude_v}",
+        if request.mode == "cw":
+            frequency_commands = [":ABOR", ":INIT:CONT OFF", ":FREQ:MODE CW", f":FREQ {request.frequency_hz}"]
+        elif request.sweep_run_mode == "free":
+            # Free continuous LIST/STEP sweep: instrument restarts after each pass.
+            frequency_commands = [
+                ":ABOR",
+                ":FREQ:MODE LIST",
+                ":LIST:DWEL:TYPE STEP",
+                ":TRIG:SOUR IMM",
+                ":LIST:TRIG:SOUR IMM",
+                ":LIST:TYPE STEP",
+                f":SWE:DWEL {max(request.dwell_ms / 1000.0, 0.005)}",
+                f":FREQ:STAR {request.sweep_start_hz}",
+                f":FREQ:STOP {request.sweep_stop_hz}",
+                f":SWE:POIN {request.sweep_points}",
+                ":INIT:CONT ON",
+                ":INIT:IMM",
             ]
-            if request.lf_output_source == "monitor":
-                lf_commands.extend([":LFO:SOUR MON", ":LFO:SOUR:MON FUNC1"])
-            elif request.lf_output_source == "function1":
-                lf_commands.extend([":LFO:SOUR FUNC1", f":LFO:FUNC:FREQ {request.fm_rate_hz}"])
-            else:
-                lf_commands.append(":LFO:SOUR DC")
-            lf_commands.append(f":LFO:STAT {'ON' if request.lf_output_enabled else 'OFF'}")
-            if not self._microwave_apply_commands(lf_commands, errors):
-                self._microwave_mark_io_failure(errors[0])
-                return {"success": False, "message": errors[0], "data": self.microwave_state}
-            notes.append("lf_output")
+        else:
+            # Trigger/single-shot: arm LIST sweep but do not free-run.
+            # Use the Trigger button (INIT:IMM) to start one pass.
+            frequency_commands = [
+                ":ABOR",
+                ":FREQ:MODE LIST",
+                ":LIST:DWEL:TYPE STEP",
+                ":TRIG:SOUR IMM",
+                ":LIST:TRIG:SOUR IMM",
+                ":LIST:TYPE STEP",
+                ":INIT:CONT OFF",
+                f":SWE:DWEL {max(request.dwell_ms / 1000.0, 0.005)}",
+                f":FREQ:STAR {request.sweep_start_hz}",
+                f":FREQ:STOP {request.sweep_stop_hz}",
+                f":SWE:POIN {request.sweep_points}",
+            ]
+        if not self._microwave_apply_commands(frequency_commands, errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("frequency")
 
-        note_text = ", ".join(notes) if notes else "当前只更新后端状态。"
-        self.microwave_state["last_error"] = "; ".join(errors)
-        if errors:
-            note_text = f"{note_text} | debug: {errors[0]}"
+        if not self._microwave_apply_commands([f":POW {request.power_dbm}"], errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("power")
+
+        if not self._microwave_apply_commands([f":OUTP {'ON' if request.output_enabled else 'OFF'}"], errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("output")
+
+        if not self._microwave_apply_commands([f":IQ:STAT {'ON' if request.iq_enabled else 'OFF'}"], errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("iq")
+
+        fm_commands: list[str] = []
+        if request.fm_enabled:
+            fm_source = "FUNCTION1" if request.fm_source == "internal" else "EXT1"
+            fm_commands.extend([f":FM:SOUR {fm_source}", f":FM {request.fm_deviation_hz}"])
+            if request.fm_source == "internal" or request.lf_output_source == "monitor":
+                fm_commands.append(f":FM:INT:FUNC:FREQ {request.fm_rate_hz}")
+        fm_commands.append(f":FM:STAT {'ON' if request.fm_enabled else 'OFF'}")
+        if not self._microwave_apply_commands(fm_commands, errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("fm")
+
+        lf_commands = [
+            f":LFO:LOAD:IMP {request.lf_output_load_ohm}",
+            f":LFO:OFFS {request.lf_output_offset_v}",
+            f":LFO:AMPL {request.lf_output_amplitude_v}",
+        ]
+        if request.lf_output_source == "monitor":
+            lf_commands.extend([":LFO:SOUR MON", ":LFO:SOUR:MON FUNC1"])
+        elif request.lf_output_source == "function1":
+            lf_commands.extend([":LFO:SOUR FUNC1", f":LFO:FUNC:FREQ {request.fm_rate_hz}"])
+        else:
+            lf_commands.append(":LFO:SOUR DC")
+        lf_commands.append(f":LFO:STAT {'ON' if request.lf_output_enabled else 'OFF'}")
+        if not self._microwave_apply_commands(lf_commands, errors):
+            self._microwave_mark_io_failure(errors[0])
+            return {"success": False, "message": errors[0], "data": self.microwave_state}
+        notes.append("lf_output")
+
+        note_text = ", ".join(notes)
+        self.microwave_state["last_error"] = ""
+        if request.mode == "sweep":
+            run_mode_label = "free连续" if request.sweep_run_mode == "free" else "trigger单次"
+            sweep_summary = (
+                f"扫频运行模式={run_mode_label}，"
+                f"扫频点数={request.sweep_points}，"
+                f"请求步进={request.sweep_step_hz:g} Hz，"
+                f"实际步进≈{actual_step_hz:g} Hz"
+            )
+            note_text = f"{note_text}; {sweep_summary}"
+            if request.sweep_run_mode == "free":
+                self._update_sweep_trigger_state(
+                    running=True,
+                    status="free_running",
+                    started_at=datetime.now().isoformat(timespec="seconds"),
+                    elapsed_s=0.0,
+                    estimated_duration_s=0.0,
+                    points=int(request.sweep_points),
+                    dwell_ms=float(request.dwell_ms),
+                    message=(
+                        f"Free 连续扫频已启动（{request.sweep_points} 点 × "
+                        f"{request.dwell_ms:g} ms/点，循环运行）"
+                    ),
+                )
+            else:
+                self._update_sweep_trigger_state(
+                    running=False,
+                    status="armed",
+                    started_at=None,
+                    elapsed_s=0.0,
+                    estimated_duration_s=self._estimate_hardware_sweep_duration_s(
+                        int(request.sweep_points), float(request.dwell_ms)
+                    ),
+                    points=int(request.sweep_points),
+                    dwell_ms=float(request.dwell_ms),
+                    message="已武装单次扫频（INIT:CONT OFF），点击「触发单次扫频」启动一轮",
+                )
+            self._log(
+                f"微波参数已同步到 Keysight: mode=sweep, run={request.sweep_run_mode}, "
+                f"{sweep_summary}, power={request.power_dbm:.1f} dBm, "
+                f"fm={'on' if request.fm_enabled else 'off'}, "
+                f"lf_out={'on' if request.lf_output_enabled else 'off'}"
+            )
+        else:
+            self._update_sweep_trigger_state(
+                running=False,
+                status="idle",
+                message="当前为定频模式",
+            )
+            self._log(
+                f"微波参数已同步到 Keysight: mode=cw, freq={request.frequency_hz:g} Hz, "
+                f"power={request.power_dbm:.1f} dBm, fm={'on' if request.fm_enabled else 'off'}, "
+                f"lf_out={'on' if request.lf_output_enabled else 'off'}"
+            )
+        return {
+            "success": True,
+            "message": f"微波参数已同步到 Keysight。{note_text}",
+            "data": self.microwave_state,
+        }
+
+    def _estimate_hardware_sweep_duration_s(self, points: int, dwell_ms: float) -> float:
+        dwell_s = min(max(float(dwell_ms) / 1000.0, 0.005), 1.0)
+        return max(1, int(points)) * dwell_s + 0.2
+
+    def _update_sweep_trigger_state(self, **changes: Any) -> None:
+        state = self.microwave_state.setdefault(
+            "sweep_trigger",
+            {
+                "running": False,
+                "status": "idle",
+                "started_at": None,
+                "elapsed_s": 0.0,
+                "estimated_duration_s": 0.0,
+                "points": 0,
+                "dwell_ms": 0.0,
+                "message": "",
+            },
+        )
+        state.update(changes)
+
+    def _wait_interruptible(self, duration_s: float) -> bool:
+        """Sleep up to duration_s; return True if cancelled."""
+        deadline = time.perf_counter() + max(0.0, float(duration_s))
+        while time.perf_counter() < deadline:
+            if self.microwave_sweep_stop_event.is_set():
+                return True
+            remaining = deadline - time.perf_counter()
+            time.sleep(min(0.1, max(0.0, remaining)))
+        return self.microwave_sweep_stop_event.is_set()
+
+    def _run_microwave_sweep_trigger_worker(
+        self,
+        *,
+        points: int,
+        dwell_ms: float,
+        start_hz: float,
+        stop_hz: float,
+        restore_output: bool,
+    ) -> None:
+        t0 = time.perf_counter()
+        estimated_s = self._estimate_hardware_sweep_duration_s(points, dwell_ms)
+        dwell_s = min(max(float(dwell_ms) / 1000.0, 0.005), 1.0)
+        errors: list[str] = []
+        try:
+            arm_commands = [
+                ":ABOR",
+                ":OUTP ON",
+                ":FREQ:MODE LIST",
+                ":LIST:TYPE STEP",
+                ":LIST:DWEL:TYPE STEP",
+                f":SWE:DWEL {dwell_s}",
+                f":FREQ:STAR {float(start_hz)}",
+                f":FREQ:STOP {float(stop_hz)}",
+                f":SWE:POIN {int(points)}",
+                ":TRIG:SOUR IMM",
+                ":LIST:TRIG:SOUR IMM",
+                ":INIT:CONT OFF",
+                ":INIT:IMM",
+            ]
+            if not self._microwave_apply_commands(arm_commands, errors):
+                self._microwave_mark_io_failure(errors[0])
+                self._update_sweep_trigger_state(
+                    running=False,
+                    status="error",
+                    elapsed_s=time.perf_counter() - t0,
+                    message=errors[0] if errors else "扫频启动失败",
+                )
+                return
+
+            self.microwave_state["config"]["mode"] = "sweep"
+            self.microwave_state["config"]["output_enabled"] = True
+            self._update_sweep_trigger_state(
+                running=True,
+                status="running",
+                message=f"仪器单次扫频进行中（{points} 点 × {dwell_ms:g} ms）",
+            )
+
+            cancelled = self._wait_interruptible(estimated_s)
+            abort_errors: list[str] = []
+            self._microwave_apply_commands([":ABOR"], abort_errors)
+
+            elapsed = time.perf_counter() - t0
+            if cancelled or self.microwave_sweep_stop_event.is_set():
+                self._update_sweep_trigger_state(
+                    running=False,
+                    status="cancelled",
+                    elapsed_s=elapsed,
+                    message=f"单次扫频已中止，已用 {elapsed:.2f} s",
+                )
+                self._log(f"微波单次扫频已中止，elapsed={elapsed:.2f}s")
+            else:
+                self._update_sweep_trigger_state(
+                    running=False,
+                    status="completed",
+                    elapsed_s=elapsed,
+                    message=f"单次扫频完成，耗时 {elapsed:.2f} s（预计 {estimated_s:.2f} s）",
+                )
+                self._log(
+                    f"微波单次扫频完成: points={points}, dwell_ms={dwell_ms:g}, "
+                    f"elapsed={elapsed:.2f}s, estimated={estimated_s:.2f}s"
+                )
+        except Exception as exc:  # pragma: no cover
+            elapsed = time.perf_counter() - t0
+            message = f"单次扫频异常: {exc}"
+            self._update_sweep_trigger_state(
+                running=False,
+                status="error",
+                elapsed_s=elapsed,
+                message=message,
+            )
+            self.microwave_state["last_error"] = message
+            self._log(message, "error")
+        finally:
+            try:
+                if self.microwave_resource is not None:
+                    restore_errors: list[str] = []
+                    self._microwave_apply_commands(
+                        [f":OUTP {'ON' if restore_output else 'OFF'}"],
+                        restore_errors,
+                    )
+                    self.microwave_state["config"]["output_enabled"] = bool(restore_output)
+            except Exception:
+                pass
+            self._update_sweep_trigger_state(running=False)
+
+    def start_microwave_sweep_trigger(self) -> dict[str, Any]:
+        if self.microwave_resource is None or not self.microwave_state.get("connected"):
+            message = "微波源未连接，无法触发扫频。"
+            self.microwave_state["last_error"] = message
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        if self.measurement_state.get("running"):
+            message = "当前有测量任务在运行（ODMR/灵敏度/跟踪等），请先停止后再触发仪器扫频。"
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        sweep_state = self.microwave_state.get("sweep_trigger") or {}
+        if sweep_state.get("status") == "free_running":
+            message = "当前为 Free 连续扫频模式。请先中止，或把扫频运行模式改为 Trigger 后再触发单次。"
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        if sweep_state.get("running") or (
+            self.microwave_sweep_thread is not None and self.microwave_sweep_thread.is_alive()
+        ):
+            message = "已有单次扫频在进行中，请等待完成或先中止。"
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        try:
+            request = self._normalize_microwave_sweep(
+                MicrowaveConfigRequest(**self.microwave_state.get("config") or {})
+            )
+        except (ValueError, TypeError) as exc:
+            message = f"扫频参数无效: {exc}"
+            self.microwave_state["last_error"] = message
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        if request.mode != "sweep":
+            message = "当前为定频模式，请先切换到扫频模式并应用配置后再触发。"
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        if request.sweep_run_mode == "free":
+            message = (
+                "扫频运行模式为 Free 连续。请先改为 Trigger 单次并「应用当前配置」，"
+                "或使用「中止扫频」后切换模式。"
+            )
+            return {"success": False, "message": message, "data": self.microwave_state}
+
+        self.microwave_state["config"] = request.model_dump()
+        points = int(request.sweep_points)
+        dwell_ms = float(request.dwell_ms)
+        estimated_s = self._estimate_hardware_sweep_duration_s(points, dwell_ms)
+        restore_output = bool(request.output_enabled)
+
+        self.microwave_sweep_stop_event.clear()
+        self._update_sweep_trigger_state(
+            running=True,
+            status="running",
+            started_at=datetime.now().isoformat(timespec="seconds"),
+            elapsed_s=0.0,
+            estimated_duration_s=estimated_s,
+            points=points,
+            dwell_ms=dwell_ms,
+            message="正在启动仪器单次扫频…",
+        )
+
+        thread = threading.Thread(
+            target=self._run_microwave_sweep_trigger_worker,
+            kwargs={
+                "points": points,
+                "dwell_ms": dwell_ms,
+                "start_hz": request.sweep_start_hz,
+                "stop_hz": request.sweep_stop_hz,
+                "restore_output": restore_output,
+            },
+            name="microwave-sweep-trigger",
+            daemon=True,
+        )
+        self.microwave_sweep_thread = thread
+        thread.start()
         self._log(
-            f"微波参数已更新: mode={request.mode}, "
-            f"power={request.power_dbm:.1f} dBm, fm={'on' if request.fm_enabled else 'off'}, "
-            f"lf_out={'on' if request.lf_output_enabled else 'off'}"
+            f"已触发微波单次扫频: {request.sweep_start_hz:g}–{request.sweep_stop_hz:g} Hz, "
+            f"points={points}, dwell={dwell_ms:g} ms, estimated={estimated_s:.2f}s"
         )
         return {
             "success": True,
-            "message": f"微波参数已保存。{note_text}",
+            "message": (
+                f"已触发单次扫频：{points} 点，驻留 {dwell_ms:g} ms，"
+                f"预计约 {estimated_s:.1f} s 后自动停止。"
+            ),
+            "data": self.microwave_state,
+        }
+
+    def stop_microwave_sweep_trigger(self) -> dict[str, Any]:
+        sweep_state = self.microwave_state.get("sweep_trigger") or {}
+        is_free = sweep_state.get("status") == "free_running"
+        thread_alive = (
+            self.microwave_sweep_thread is not None and self.microwave_sweep_thread.is_alive()
+        )
+        running = bool(sweep_state.get("running")) or thread_alive or is_free
+        if not running:
+            message = "当前没有进行中的扫频。"
+            return {"success": True, "message": message, "data": self.microwave_state}
+
+        self.microwave_sweep_stop_event.set()
+        errors: list[str] = []
+        if self.microwave_resource is not None:
+            # Abort and leave continuous initiation off so free-run stops cleanly.
+            self._microwave_apply_commands([":ABOR", ":INIT:CONT OFF"], errors)
+
+        if is_free and not thread_alive:
+            self._update_sweep_trigger_state(
+                running=False,
+                status="cancelled",
+                message="Free 连续扫频已中止",
+            )
+            # Keep config mode free so re-apply can restart continuous sweep;
+            # user must change sweep_run_mode + apply to switch to trigger.
+            self._log("已中止微波 Free 连续扫频")
+            return {
+                "success": True,
+                "message": "已中止 Free 连续扫频。再次「应用当前配置」可重新启动连续扫频。",
+                "data": self.microwave_state,
+            }
+
+        self._update_sweep_trigger_state(
+            status="cancelling",
+            message="正在中止单次扫频…",
+        )
+        self._log("已请求中止微波单次扫频")
+        return {
+            "success": True,
+            "message": "已请求中止单次扫频。",
             "data": self.microwave_state,
         }
 
@@ -2181,9 +2603,18 @@ class InstrumentManager:
         request: CurrentTrackingRequest,
         result: dict[str, Any],
         status: str = "completed",
+        *,
+        error_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        info = dict(error_info or {})
         recording_state = (
-            self.current_tracking_recordings.finish(status)
+            self.current_tracking_recordings.finish(
+                status,
+                error_message=str(info.get("message") or info.get("error_message") or ""),
+                failed_stage=str(info.get("failed_stage") or ""),
+                error_code=str(info.get("error_code") or ""),
+                error_hint=str(info.get("hint") or info.get("error_hint") or ""),
+            )
             if request.record_enabled
             else {
                 "status": "disabled",
@@ -2225,8 +2656,17 @@ class InstrumentManager:
     def finish_current_tracking_recording(
         self,
         status: str,
+        *,
+        error_info: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        return self.current_tracking_recordings.finish(status)
+        info = dict(error_info or {})
+        return self.current_tracking_recordings.finish(
+            status,
+            error_message=str(info.get("message") or info.get("error_message") or ""),
+            failed_stage=str(info.get("failed_stage") or ""),
+            error_code=str(info.get("error_code") or ""),
+            error_hint=str(info.get("hint") or info.get("error_hint") or ""),
+        )
 
     def current_tracking_recording_status(
         self,
@@ -3377,21 +3817,60 @@ class InstrumentManager:
         request: CurrentTrackingRequest,
         event_callback: Any | None = None,
     ) -> dict[str, Any]:
-        """按 FM 1f 的 R 双瓣谷定位 + 复数 b/g 鉴频执行双峰交替闭环。"""
+        """按 FM 1f 的 R 双瓣谷定位 + 复数 b/g 鉴频执行双峰交替闭环。
+
+        Peak centers are always the valley minima of lobe–valley–lobe structures
+        on the FM 1f R trace; sensitivity knobs must not change that definition.
+        """
         if np is None:
-            raise RuntimeError("numpy 不可用，无法执行规范化双峰跟踪。")
+            raise CurrentTrackingError(
+                "numpy 不可用，无法执行规范化双峰跟踪。",
+                stage="setup",
+                code="numpy_missing",
+                hint="安装 numpy 后重启后端。",
+            )
         if self.lockin_device is None or self.lockin_session is None:
-            raise RuntimeError("锁相未连接，无法执行规范化双峰跟踪。")
+            raise CurrentTrackingError(
+                "锁相未连接，无法执行规范化双峰跟踪。",
+                stage="setup",
+                code="lockin_disconnected",
+                hint="请先在设备页连接锁相。",
+            )
         if self.microwave_resource is None or not self.microwave_state.get("connected"):
-            raise RuntimeError("微波源未连接，无法执行规范化双峰跟踪。")
+            raise CurrentTrackingError(
+                "微波源未连接，无法执行规范化双峰跟踪。",
+                stage="setup",
+                code="microwave_unavailable",
+                hint="请先连接微波源并确认快速捷变频可用。",
+            )
         if request.stop_hz <= request.start_hz:
-            raise RuntimeError("跟踪终止频率必须大于起始频率。")
+            raise CurrentTrackingError(
+                "跟踪终止频率必须大于起始频率。",
+                stage="setup",
+                code="bad_range",
+                hint="将终止频率设为大于起始频率。",
+            )
         if request.bad_samples_to_lose < request.bad_samples_to_suspect:
-            raise RuntimeError("bad_samples_to_lose 不能小于 bad_samples_to_suspect。")
+            raise CurrentTrackingError(
+                "bad_samples_to_lose 不能小于 bad_samples_to_suspect。",
+                stage="setup",
+                code="bad_quality_thresholds",
+                hint="坏样本丢锁阈值必须 ≥ 进入可疑的坏样本数。",
+            )
         if request.slope_ratio_max <= request.slope_ratio_min:
-            raise RuntimeError("实时斜率比例上限必须大于下限。")
+            raise CurrentTrackingError(
+                "实时斜率比例上限必须大于下限。",
+                stage="setup",
+                code="bad_slope_ratio",
+                hint="将 slope_ratio_max 设为大于 slope_ratio_min。",
+            )
         if request.delta_f_max_hz <= request.delta_f_min_hz:
-            raise RuntimeError("Δf 物理上限必须大于下限。")
+            raise CurrentTrackingError(
+                "Δf 物理上限必须大于下限。",
+                stage="setup",
+                code="bad_delta_f_window",
+                hint="将 delta_f_max_hz 设为大于 delta_f_min_hz。",
+            )
 
         channel_index = self._resolve_measurement_channel_index(request.channel_index)
         dc_channel_index = (
@@ -3530,6 +4009,8 @@ class InstrumentManager:
             frequency_hz: Any,
             measurements: list[PeakMeasurement],
         ) -> tuple[Any, Any]:
+            # Structure invariant: each resonance is a lobe–valley–lobe on FM 1f R;
+            # center_hz is the valley minimum, never an arbitrary extremum.
             candidates = find_fm_magnitude_resonances(
                 frequencies_hz=frequency_hz,
                 r_values=[item.dc for item in measurements],
@@ -3537,8 +4018,14 @@ class InstrumentManager:
                 minimum_prominence_fraction=request.minimum_peak_prominence_fraction,
             )
             if len(candidates) < 2:
-                raise RuntimeError(
-                    "完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振。"
+                raise CurrentTrackingError(
+                    "完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振。",
+                    stage="full_scan",
+                    code="no_two_lobes",
+                    hint=(
+                        "检查 1f FM、扫频是否包住双峰，并增加搜索点数/驻留；"
+                        "峰心必须是双瓣夹谷的谷底。"
+                    ),
                 )
             try:
                 return select_fm_resonance_pair(
@@ -3552,7 +4039,13 @@ class InstrumentManager:
                     ),
                 )
             except ValueError as exc:
-                raise RuntimeError(str(exc)) from exc
+                info = classify_current_tracking_failure(str(exc))
+                raise CurrentTrackingError(
+                    str(exc),
+                    stage=info["failed_stage"] if info["failed_stage"] != "unknown" else "full_scan",
+                    code=info["error_code"] if info["error_code"] != "unknown" else "pair_select_failed",
+                    hint=info["hint"],
+                ) from exc
 
         def identity_bounds(
             tracker: PeakTracker,
@@ -3604,7 +4097,12 @@ class InstrumentManager:
                 band_max_hz - center_hz,
             )
             if not math.isfinite(span_hz) or span_hz <= 0:
-                raise RuntimeError(f"{peak_id.value} 峰复数标定窗口无效。")
+                raise CurrentTrackingError(
+                    f"{peak_id.value} 峰复数标定窗口无效。",
+                    stage="calibrate",
+                    code="fit_window_invalid",
+                    hint="谷心太靠近身份边界或 FWHM 异常；收紧范围后重扫双瓣谷心。",
+                )
             offsets = np.linspace(
                 -span_hz,
                 span_hz,
@@ -3614,22 +4112,36 @@ class InstrumentManager:
                 acquire_at(peak_id, float(center_hz + offset)) for offset in offsets
             ]
             if not all(item.basic_valid() for item in measurements):
-                raise RuntimeError(f"{peak_id.value} 峰复数标定采样无效。")
-            model = fit_complex_affine_model(
-                frequencies_hz=[item.commanded_frequency_hz for item in measurements],
-                x_values=[item.x1 for item in measurements],
-                y_values=[item.y1 for item in measurements],
-                center_hz=center_hz,
-                fwhm_hz=fwhm_hz,
-                depth_reference=depth_reference,
-                dc_center_reference=dc_center_reference,
-                dc_baseline_at_center=dc_baseline,
-                local_band_min_hz=band_min_hz,
-                local_band_max_hz=band_max_hz,
-                minimum_fit_r2=request.minimum_complex_fit_r2,
-                slope_epsilon=request.slope_epsilon,
-                orthogonal_limit_fraction=request.orthogonal_limit_fraction,
-            )
+                raise CurrentTrackingError(
+                    f"{peak_id.value} 峰复数标定采样无效。",
+                    stage="calibrate",
+                    code="fit_samples_invalid",
+                    hint="增加跟踪驻留/平均次数，检查锁相采样。",
+                )
+            try:
+                model = fit_complex_affine_model(
+                    frequencies_hz=[item.commanded_frequency_hz for item in measurements],
+                    x_values=[item.x1 for item in measurements],
+                    y_values=[item.y1 for item in measurements],
+                    center_hz=center_hz,
+                    fwhm_hz=fwhm_hz,
+                    depth_reference=depth_reference,
+                    dc_center_reference=dc_center_reference,
+                    dc_baseline_at_center=dc_baseline,
+                    local_band_min_hz=band_min_hz,
+                    local_band_max_hz=band_max_hz,
+                    minimum_fit_r2=request.minimum_complex_fit_r2,
+                    slope_epsilon=request.slope_epsilon,
+                    orthogonal_limit_fraction=request.orthogonal_limit_fraction,
+                )
+            except ValueError as exc:
+                info = classify_current_tracking_failure(str(exc))
+                raise CurrentTrackingError(
+                    str(exc),
+                    stage="calibrate",
+                    code=info["error_code"] if info["error_code"] != "unknown" else "fit_failed",
+                    hint=info["hint"],
+                ) from exc
             model.version = version
             return model, measurements[-1].timestamp_s
 
@@ -3663,7 +4175,12 @@ class InstrumentManager:
                 scan_measurements.append(acquire_at(PeakId.LEFT, float(frequency_hz)))
                 self.measurement_state["progress"] = (index + 1) / max(1, frequencies.size)
             if not all(item.basic_valid() for item in scan_measurements):
-                raise RuntimeError("完整扫频包含无效采样，无法可靠分配双峰身份。")
+                raise CurrentTrackingError(
+                    "完整扫频包含无效采样，无法可靠分配双峰身份。",
+                    stage="full_scan",
+                    code="scan_invalid_samples",
+                    hint="检查锁相/微波连接与驻留时间，避免扫频点上出现 NaN。",
+                )
             left_candidate, right_candidate = detect_unique_peak_pair(
                 frequencies,
                 scan_measurements,
@@ -3671,7 +4188,12 @@ class InstrumentManager:
             left_center_hz = float(left_candidate.center_hz)
             right_center_hz = float(right_candidate.center_hz)
             if not left_center_hz < right_center_hz:
-                raise RuntimeError("双峰身份分配失败：左峰不小于右峰。")
+                raise CurrentTrackingError(
+                    "双峰身份分配失败：左峰不小于右峰。",
+                    stage="full_scan",
+                    code="identity_order",
+                    hint="扫频结果异常，请重扫或收紧范围后重试。",
+                )
             left_fwhm_hz = float(left_candidate.fwhm_hz)
             right_fwhm_hz = float(right_candidate.fwhm_hz)
             separation_hz = right_center_hz - left_center_hz
@@ -3679,7 +4201,12 @@ class InstrumentManager:
                 left_fwhm_hz,
                 right_fwhm_hz,
             ):
-                raise RuntimeError("双峰间距小于可分辨阈值，禁止输出电流。")
+                raise CurrentTrackingError(
+                    "双峰间距小于可分辨阈值，禁止输出电流。",
+                    stage="full_scan",
+                    code="pair_unresolved",
+                    hint="两峰过近或分辨率不足：增大 search_points，或略降 minimum_resolvable_separation_factor。",
+                )
             midpoint_hz = 0.5 * (left_center_hz + right_center_hz)
             guard_hz = request.reacquire_identity_guard_fraction * min(
                 left_fwhm_hz,
@@ -3687,6 +4214,21 @@ class InstrumentManager:
             )
             left_band = (request.start_hz, midpoint_hz - guard_hz)
             right_band = (midpoint_hz + guard_hz, request.stop_hz)
+            # Confirm to UI: selected centers are FM lobe–valley–lobe minima only.
+            publish(
+                {
+                    "type": "current_tracking_pair_selected",
+                    "selection_rule": "fm_lobe_valley_lobe_minima",
+                    "left_center_hz": left_center_hz,
+                    "right_center_hz": right_center_hz,
+                    "left_prominence_r": float(left_candidate.prominence_r),
+                    "right_prominence_r": float(right_candidate.prominence_r),
+                    "left_fwhm_hz": left_fwhm_hz,
+                    "right_fwhm_hz": right_fwhm_hz,
+                    "separation_hz": separation_hz,
+                    "reason": reason,
+                }
+            )
             global_state = GlobalState.CALIBRATE
             publish(
                 {
@@ -4192,8 +4734,11 @@ class InstrumentManager:
 
         try:
             if not self.prepare_microwave_fast_tracking():
-                raise RuntimeError(
-                    self.microwave_state.get("last_error") or "无法进入快速捷变频模式。"
+                raise CurrentTrackingError(
+                    self.microwave_state.get("last_error") or "无法进入快速捷变频模式。",
+                    stage="setup",
+                    code="microwave_unavailable",
+                    hint="请先连接微波源并确认快速捷变频可用。",
                 )
             publish(
                 {
@@ -4240,7 +4785,12 @@ class InstrumentManager:
                     }
                     publish(invalid_event)
                     if request.max_relock_attempts and relock_count > request.max_relock_attempts:
-                        raise RuntimeError("全频段重捕获次数超过配置上限。")
+                        raise CurrentTrackingError(
+                            "全频段重捕获次数超过配置上限。",
+                            stage="track",
+                            code="max_relock",
+                            hint="增大 max_relock_attempts，或排查信号漂移/范围是否仍包住双峰。",
+                        )
                     if request.relock_cooldown_s > 0:
                         time.sleep(request.relock_cooldown_s)
                     left, right = full_acquire("peak_lost")

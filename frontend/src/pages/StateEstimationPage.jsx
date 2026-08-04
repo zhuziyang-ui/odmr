@@ -29,7 +29,43 @@ import { api, wsUrl } from "../lib/api";
 
 const CALIBRATION_STORAGE_KEY = "nv-current-physical-calibration-v3";
 const FORM_STORAGE_KEY = "nv-state-estimation-form-v1";
-const MAX_PLOT_POINTS = 600;
+const PLOT_BUFFER_KEEP_S = 3600;
+const PLOT_WINDOW_STORAGE_KEY = "nv-live-plot-window-s-v1";
+const PLOT_WINDOW_OPTIONS = [
+  { value: "2", label: "2 s", seconds: 2 },
+  { value: "10", label: "10 s", seconds: 10 },
+  { value: "60", label: "60 s", seconds: 60 },
+  { value: "300", label: "5 min", seconds: 300 },
+  { value: "3600", label: "1 h", seconds: 3600 },
+];
+const MAX_BUFFER_POINTS = 50000;
+
+function loadPlotWindowSeconds() {
+  if (typeof window === "undefined") {
+    return 60;
+  }
+  try {
+    const raw = window.localStorage.getItem(PLOT_WINDOW_STORAGE_KEY);
+    const match = PLOT_WINDOW_OPTIONS.find((item) => item.value === String(raw));
+    if (match) {
+      return match.seconds;
+    }
+  } catch {
+    // ignore
+  }
+  return 60;
+}
+
+function persistPlotWindowSeconds(seconds) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(PLOT_WINDOW_STORAGE_KEY, String(seconds));
+  } catch {
+    // ignore
+  }
+}
 
 const DEFAULT_FORM = {
   estimator_type: "ekf",
@@ -157,10 +193,30 @@ function fitCalibration(points) {
 }
 
 function appendBounded(previous, point) {
+  const tEnd = finite(point?.elapsed_s, NaN);
   const next = [...previous, point];
-  return next.length > MAX_PLOT_POINTS
-    ? next.slice(next.length - MAX_PLOT_POINTS)
-    : next;
+  if (!Number.isFinite(tEnd)) {
+    return next.length > MAX_BUFFER_POINTS ? next.slice(-MAX_BUFFER_POINTS) : next;
+  }
+  const kept = next.filter(
+    (item) => tEnd - finite(item?.elapsed_s, tEnd) <= PLOT_BUFFER_KEEP_S
+  );
+  return kept.length > MAX_BUFFER_POINTS ? kept.slice(-MAX_BUFFER_POINTS) : kept;
+}
+
+function sliceHistoryByWindow(history, windowSeconds) {
+  const list = Array.isArray(history) ? history : [];
+  if (!list.length) {
+    return { history: [], xRange: undefined };
+  }
+  const tEnd = finite(list[list.length - 1]?.elapsed_s, 0);
+  const windowS = Math.max(1, finite(windowSeconds, 60));
+  const tStart = tEnd - windowS;
+  const visible = list.filter((item) => finite(item?.elapsed_s, -1e99) >= tStart);
+  return {
+    history: visible,
+    xRange: [Math.max(0, tStart), Math.max(tEnd, tStart + 1e-3)],
+  };
 }
 
 function formatFrequency(value) {
@@ -211,6 +267,7 @@ export default function StateEstimationPage() {
   const [status, setStatus] = useState("等待启动");
   const [latestPoint, setLatestPoint] = useState(null);
   const [history, setHistory] = useState([]);
+  const [plotWindowS, setPlotWindowS] = useState(loadPlotWindowSeconds);
   const [scanTrace, setScanTrace] = useState([]);
   const [reacquireMessage, setReacquireMessage] = useState("");
   const socketRef = useRef(null);
@@ -428,7 +485,17 @@ export default function StateEstimationPage() {
     measurement.mode !== "state_estimation_current";
   const confidencePercent =
     100 * finite(latestPoint?.confidence_0_to_1, 0);
-  const timeValues = history.map((point) => finite(point.elapsed_s));
+  const plotSlice = sliceHistoryByWindow(history, plotWindowS);
+  const plotHistory = plotSlice.history;
+  const plotXRange = plotSlice.xRange;
+  const timeValues = plotHistory.map((point) => finite(point.elapsed_s));
+
+  const changePlotWindow = (value) => {
+    const match = PLOT_WINDOW_OPTIONS.find((item) => item.value === String(value));
+    const seconds = match?.seconds ?? 60;
+    setPlotWindowS(seconds);
+    persistPlotWindowSeconds(seconds);
+  };
 
   return (
     <Stack gap="lg">
@@ -469,10 +536,10 @@ export default function StateEstimationPage() {
           label="估计电流"
           value={formatCurrent(latestPoint?.current_a)}
           hint={
-            latestPoint?.current_ci95_a
-              ? `95% CI ${formatCurrent(
-                  latestPoint.current_ci95_a[0]
-                )} ～ ${formatCurrent(latestPoint.current_ci95_a[1])}`
+            latestPoint?.current_ci99_a
+              ? `99% CI ${formatCurrent(
+                  latestPoint.current_ci99_a[0]
+                )} ～ ${formatCurrent(latestPoint.current_ci99_a[1])}`
               : "等待可信区间"
           }
         />
@@ -480,10 +547,10 @@ export default function StateEstimationPage() {
           label="物理劈裂 Δf"
           value={formatMHz(latestPoint?.splitting_hz)}
           hint={
-            latestPoint?.splitting_ci95_hz
-              ? `95% CI ${formatMHz(
-                  latestPoint.splitting_ci95_hz[0]
-                )} ～ ${formatMHz(latestPoint.splitting_ci95_hz[1])}`
+            latestPoint?.splitting_ci99_hz
+              ? `99% CI ${formatMHz(
+                  latestPoint.splitting_ci99_hz[0]
+                )} ～ ${formatMHz(latestPoint.splitting_ci99_hz[1])}`
               : "等待可信区间"
           }
         />
@@ -846,6 +913,20 @@ export default function StateEstimationPage() {
         ) : null}
       </Group>
 
+      <Group justify="flex-end" mb="xs">
+        <Select
+          label="显示窗口"
+          description="频率与电流图共用；内存最多保留最近 1 h"
+          value={String(plotWindowS)}
+          data={PLOT_WINDOW_OPTIONS.map((item) => ({
+            value: item.value,
+            label: item.label,
+          }))}
+          onChange={changePlotWindow}
+          w={180}
+          allowDeselect={false}
+        />
+      </Group>
       <SimpleGrid cols={{ base: 1, xl: 2 }}>
         <SectionCard
           title="双峰频率与 1σ 置信带"
@@ -856,19 +937,19 @@ export default function StateEstimationPage() {
               {
                 name: "fL",
                 x: timeValues,
-                y: history.map((point) => finite(point.f_left_hz) / 1e9),
+                y: plotHistory.map((point) => finite(point.f_left_hz) / 1e9),
                 lineColor: "#5ad1ff",
               },
               {
                 name: "fR",
                 x: timeValues,
-                y: history.map((point) => finite(point.f_right_hz) / 1e9),
+                y: plotHistory.map((point) => finite(point.f_right_hz) / 1e9),
                 lineColor: "#45e0a8",
               },
               {
                 name: "fL + 1σ",
                 x: timeValues,
-                y: history.map(
+                y: plotHistory.map(
                   (point) =>
                     (finite(point.f_left_hz) +
                       finite(point.f_left_sigma_hz)) /
@@ -880,7 +961,7 @@ export default function StateEstimationPage() {
               {
                 name: "fR - 1σ",
                 x: timeValues,
-                y: history.map(
+                y: plotHistory.map(
                   (point) =>
                     (finite(point.f_right_hz) -
                       finite(point.f_right_sigma_hz)) /
@@ -892,7 +973,8 @@ export default function StateEstimationPage() {
             ]}
             xTitle="运行时间 (s)"
             yTitle="频率 (GHz)"
-            uirevision="state-estimation-frequencies"
+            xRange={plotXRange}
+            uirevision={`state-estimation-frequencies-${plotWindowS}`}
           />
         </SectionCard>
 
@@ -905,7 +987,7 @@ export default function StateEstimationPage() {
               {
                 name: "I",
                 x: timeValues,
-                y: history.map((point) =>
+                y: plotHistory.map((point) =>
                   point.current_a == null
                     ? null
                     : finite(point.current_a) * 1e3
@@ -915,7 +997,7 @@ export default function StateEstimationPage() {
               {
                 name: "I + 1σ",
                 x: timeValues,
-                y: history.map((point) =>
+                y: plotHistory.map((point) =>
                   point.current_a == null
                     ? null
                     : (finite(point.current_a) +
@@ -928,7 +1010,7 @@ export default function StateEstimationPage() {
               {
                 name: "I - 1σ",
                 x: timeValues,
-                y: history.map((point) =>
+                y: plotHistory.map((point) =>
                   point.current_a == null
                     ? null
                     : (finite(point.current_a) -
@@ -941,7 +1023,8 @@ export default function StateEstimationPage() {
             ]}
             xTitle="运行时间 (s)"
             yTitle="电流 (mA)"
-            uirevision="state-estimation-current"
+            xRange={plotXRange}
+            uirevision={`state-estimation-current-${plotWindowS}`}
           />
         </SectionCard>
       </SimpleGrid>

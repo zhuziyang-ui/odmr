@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Badge,
   Button,
   Grid,
   Group,
@@ -125,6 +126,26 @@ function formatSlope(value) {
     return "--";
   }
   return `${numeric.toFixed(3)} µV/MHz`;
+}
+
+/** Format seconds for ODMR scan timing display. */
+function formatElapsedSeconds(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return "--";
+  }
+  if (numeric < 60) {
+    return `${numeric.toFixed(2)} s`;
+  }
+  const minutes = Math.floor(numeric / 60);
+  const seconds = numeric - minutes * 60;
+  return `${minutes}m ${seconds.toFixed(1)}s`;
+}
+
+function estimateOdmrDwellSeconds(form) {
+  const points = Math.max(0, Math.round(toFiniteNumber(form?.points, 0)));
+  const dwellS = Math.min(Math.max(toFiniteNumber(form?.dwell_ms, 0) / 1000, 0.005), 1.0);
+  return points * dwellS;
 }
 
 function lastValue(values) {
@@ -313,11 +334,16 @@ export default function OdmrPage() {
   const [estimatedDuration, setEstimatedDuration] = useState(0);
   const [sensitivityEstimatedDuration, setSensitivityEstimatedDuration] = useState(0);
   const [liveReadout, setLiveReadout] = useState(false);
+  const [odmrElapsedS, setOdmrElapsedS] = useState(0);
+  const [odmrEtaS, setOdmrEtaS] = useState(null);
+  const [odmrLastTotalS, setOdmrLastTotalS] = useState(null);
+  const [odmrConfigConfirmed, setOdmrConfigConfirmed] = useState(false);
   const odmrSocketRef = useRef(null);
   const sensitivitySocketRef = useRef(null);
   const pendingOdmrRef = useRef(null);
   const pendingSensitivityRef = useRef(null);
   const hasHydratedRef = useRef(false);
+  const odmrScanStartMsRef = useRef(null);
 
   useEffect(() => {
     if (!data?.measurement || hasHydratedRef.current) {
@@ -350,6 +376,23 @@ export default function OdmrPage() {
     setSensitivityResult(normalizeSensitivityResult(data.measurement.last_sensitivity_result));
   }, [data, isSensitivityRunning]);
 
+  // Local wall-clock timer for ODMR scan (smooth UI between websocket points).
+  useEffect(() => {
+    if (!isOdmrRunning || odmrScanStartMsRef.current == null) {
+      return undefined;
+    }
+    const tick = () => {
+      const startMs = odmrScanStartMsRef.current;
+      if (startMs == null) {
+        return;
+      }
+      setOdmrElapsedS((performance.now() - startMs) / 1000);
+    };
+    tick();
+    const timerId = window.setInterval(tick, 100);
+    return () => window.clearInterval(timerId);
+  }, [isOdmrRunning]);
+
   useEffect(() => {
     let active = true;
     let reconnectTimer = 0;
@@ -378,12 +421,16 @@ export default function OdmrPage() {
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === "odmr_started") {
+            odmrScanStartMsRef.current = performance.now();
             setIsOdmrRunning(true);
             setOdmrProgress(0);
             setOdmrStatusText(payload.live_readout ? "正在真实扫描" : "正在模拟扫描");
             setCurrentPoint(0);
             setCurrentFrequencyHz(0);
             setCurrentValue(0);
+            setOdmrElapsedS(0);
+            setOdmrEtaS(toFiniteNumber(payload.estimated_duration_s, 0));
+            setOdmrLastTotalS(null);
             setEstimatedDuration(toFiniteNumber(payload.estimated_duration_s, 0));
             setLiveReadout(Boolean(payload.live_readout));
             setTrace({
@@ -398,6 +445,19 @@ export default function OdmrPage() {
             setCurrentFrequencyHz(toFiniteNumber(payload.frequency_hz, 0));
             setCurrentValue(toFiniteNumber(payload.value, 0));
             setLiveReadout(Boolean(payload.live_readout));
+            if (payload.elapsed_s != null) {
+              setOdmrElapsedS(toFiniteNumber(payload.elapsed_s, 0));
+              if (odmrScanStartMsRef.current == null) {
+                odmrScanStartMsRef.current = performance.now() - toFiniteNumber(payload.elapsed_s, 0) * 1000;
+              }
+            }
+            if (payload.eta_s != null) {
+              setOdmrEtaS(Math.max(0, toFiniteNumber(payload.eta_s, 0)));
+            } else if (payload.index > 0 && payload.points > 0 && payload.elapsed_s != null) {
+              const elapsed = toFiniteNumber(payload.elapsed_s, 0);
+              const remaining = Math.max(0, toFiniteNumber(payload.points, 0) - toFiniteNumber(payload.index, 0));
+              setOdmrEtaS((elapsed / toFiniteNumber(payload.index, 1)) * remaining);
+            }
             setTrace((prev) => ({
               frequency_hz: [...(prev?.frequency_hz || []), payload.frequency_hz],
               intensity: [...(prev?.intensity || []), payload.value],
@@ -405,24 +465,57 @@ export default function OdmrPage() {
               readout_source: payload.readout_source,
             }));
           } else if (payload.type === "odmr_complete") {
+            const totalS = toFiniteNumber(payload.elapsed_s, odmrScanStartMsRef.current != null
+              ? (performance.now() - odmrScanStartMsRef.current) / 1000
+              : 0);
+            odmrScanStartMsRef.current = null;
             setIsOdmrRunning(false);
             setOdmrProgress(1);
             setOdmrStatusText("扫描完成");
+            setOdmrElapsedS(totalS);
+            setOdmrEtaS(0);
+            setOdmrLastTotalS(totalS);
             setTrace(payload.trace || createEmptyTrace());
-            notifications.show({ color: "teal", title: "扫描完成", message: "ODMR 扫描已完成" });
+            notifications.show({
+              color: "teal",
+              title: "扫描完成",
+              message: `ODMR 扫描已完成，本轮耗时 ${formatElapsedSeconds(totalS)}（dwell 预计 ${formatElapsedSeconds(payload.estimated_duration_s)}）`,
+            });
             await refresh();
           } else if (payload.type === "odmr_cancelled") {
+            const totalS = toFiniteNumber(payload.elapsed_s, odmrScanStartMsRef.current != null
+              ? (performance.now() - odmrScanStartMsRef.current) / 1000
+              : 0);
+            odmrScanStartMsRef.current = null;
             setIsOdmrRunning(false);
             setOdmrProgress(toFiniteNumber(payload.progress, 0));
             setOdmrStatusText("扫描已停止");
+            setOdmrElapsedS(totalS);
+            setOdmrEtaS(null);
+            setOdmrLastTotalS(totalS);
             if (payload.trace) {
               setTrace(payload.trace);
             }
-            notifications.show({ color: "yellow", title: "扫描已停止", message: "当前 ODMR 任务已停止" });
+            notifications.show({
+              color: "yellow",
+              title: "扫描已停止",
+              message: `已停止，已用 ${formatElapsedSeconds(totalS)}`,
+            });
             await refresh();
           } else if (payload.type === "odmr_error") {
+            const totalS = payload.elapsed_s != null
+              ? toFiniteNumber(payload.elapsed_s, 0)
+              : odmrScanStartMsRef.current != null
+                ? (performance.now() - odmrScanStartMsRef.current) / 1000
+                : null;
+            odmrScanStartMsRef.current = null;
             setIsOdmrRunning(false);
             setOdmrStatusText(payload.message || "扫描失败");
+            if (totalS != null) {
+              setOdmrElapsedS(totalS);
+              setOdmrLastTotalS(totalS);
+            }
+            setOdmrEtaS(null);
             notifications.show({
               color: "red",
               title: "扫描失败",
@@ -668,6 +761,53 @@ export default function OdmrPage() {
   const asdRevision = `asd-${(asdSpectrum.frequency_hz || []).length}-${toFiniteNumber(lastValue(asdSpectrum.frequency_hz), 0).toFixed(6)}`;
   const sensitivityRevision = `sensitivity-${(asdSpectrum.sensitivity_t_per_sqrt_hz || []).length}-${bestSensitivityFrequencyHz.toFixed(6)}`;
 
+  const patchOdmrForm = (updater) => {
+    setOdmrConfigConfirmed(false);
+    setOdmrForm(updater);
+  };
+
+  const confirmOdmrConfig = () => {
+    if (!odmrForm) {
+      notifications.show({ color: "red", title: "无法确认", message: "ODMR 表单尚未就绪。" });
+      return false;
+    }
+    if (toFiniteNumber(odmrForm.start_hz) >= toFiniteNumber(odmrForm.stop_hz)) {
+      notifications.show({ color: "red", title: "参数错误", message: "起始频率必须小于终止频率" });
+      return false;
+    }
+    if (toFiniteNumber(odmrForm.points) < 3) {
+      notifications.show({ color: "red", title: "参数错误", message: "扫描点数至少为 3" });
+      return false;
+    }
+    if (toFiniteNumber(odmrForm.dwell_ms) <= 0) {
+      notifications.show({ color: "red", title: "参数错误", message: "驻留时间必须大于 0" });
+      return false;
+    }
+    if (toFiniteNumber(odmrForm.averages) < 1) {
+      notifications.show({ color: "red", title: "参数错误", message: "平均次数至少为 1" });
+      return false;
+    }
+    if (odmrForm.scan_mode === "aux_map") {
+      if (toFiniteNumber(odmrForm.aux_voltage_min_v) >= toFiniteNumber(odmrForm.aux_voltage_max_v)) {
+        notifications.show({ color: "red", title: "参数错误", message: "Aux 最小电压必须小于最大电压" });
+        return false;
+      }
+      if (toFiniteNumber(odmrForm.aux_frequency_min_hz) >= toFiniteNumber(odmrForm.aux_frequency_max_hz)) {
+        notifications.show({ color: "red", title: "参数错误", message: "映射最小频率必须小于最大频率" });
+        return false;
+      }
+    }
+    setOdmrConfigConfirmed(true);
+    const startHz = toFiniteNumber(odmrForm.start_hz);
+    const stopHz = toFiniteNumber(odmrForm.stop_hz);
+    notifications.show({
+      color: "teal",
+      title: "配置已确认",
+      message: `ODMR ${odmrForm.scan_mode} · ${(startHz / 1e9).toFixed(4)}–${(stopHz / 1e9).toFixed(4)} GHz · ${Math.round(toFiniteNumber(odmrForm.points))} 点 · 驻留 ${toFiniteNumber(odmrForm.dwell_ms).toFixed(1)} ms · 平均 ${Math.round(toFiniteNumber(odmrForm.averages))} · 读出 ${shortReadout(odmrForm.readout_source)}`,
+    });
+    return true;
+  };
+
   const runOdmr = () => {
     const socket = odmrSocketRef.current;
     if (toFiniteNumber(odmrForm.start_hz) >= toFiniteNumber(odmrForm.stop_hz)) {
@@ -676,6 +816,14 @@ export default function OdmrPage() {
     }
     if (toFiniteNumber(odmrForm.points) < 3) {
       notifications.show({ color: "red", title: "参数错误", message: "扫描点数至少为 3" });
+      return;
+    }
+    if (!odmrConfigConfirmed) {
+      notifications.show({
+        color: "yellow",
+        title: "请先确认配置",
+        message: "修改参数后需点击「确认配置」，校验通过后再开始扫描。",
+      });
       return;
     }
     if (isMeasurementRunning) {
@@ -689,7 +837,12 @@ export default function OdmrPage() {
         message: "锁相或微波源未连接时，ODMR 可能退回到模拟 trace",
       });
     }
+    const dwellEstimate = estimateOdmrDwellSeconds(odmrForm);
+    setEstimatedDuration(dwellEstimate);
     setOdmrProgress(0);
+    setOdmrElapsedS(0);
+    setOdmrEtaS(dwellEstimate);
+    setOdmrLastTotalS(null);
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       pendingOdmrRef.current = { ...odmrForm };
       setOdmrStatusText("等待 ODMR WebSocket 建立");
@@ -761,7 +914,7 @@ export default function OdmrPage() {
 
   const syncFromMicrowave = () => {
     const microwaveConfig = data.microwave.config || {};
-    setOdmrForm((prev) => ({
+    patchOdmrForm((prev) => ({
       ...prev,
       start_hz: toFiniteNumber(microwaveConfig.sweep_start_hz, prev.start_hz),
       stop_hz: toFiniteNumber(microwaveConfig.sweep_stop_hz, prev.stop_hz),
@@ -773,7 +926,7 @@ export default function OdmrPage() {
 
   const syncReadoutFromLockin = () => {
     const nextSource = activeLockinChannel?.display_source ?? odmrForm.readout_source;
-    setOdmrForm((prev) => ({ ...prev, readout_source: nextSource }));
+    patchOdmrForm((prev) => ({ ...prev, readout_source: nextSource }));
     notifications.show({
       color: "teal",
       title: "已同步",
@@ -819,6 +972,10 @@ export default function OdmrPage() {
     downloadJsonFile(`odmr_${timestamp}.json`, {
       exported_at: new Date().toISOString(),
       request: odmrForm,
+      timing: {
+        estimated_dwell_s: estimateOdmrDwellSeconds(odmrForm),
+        last_total_elapsed_s: odmrLastTotalS,
+      },
       trace,
     });
     notifications.show({ color: "teal", title: "导出完成", message: "ODMR JSON 已开始下载" });
@@ -927,7 +1084,11 @@ export default function OdmrPage() {
         <MetricCard
           label="任务进度"
           value={`${(measurementProgress * 100).toFixed(1)}%`}
-          hint={`预计 ${toFiniteNumber(measurement.estimated_duration_s, 0).toFixed(2)} s`}
+          hint={
+            isOdmrRunning
+              ? `已用 ${formatElapsedSeconds(odmrElapsedS)} | dwell 预计 ${formatElapsedSeconds(estimatedDuration)}`
+              : `dwell 预计 ${toFiniteNumber(measurement.estimated_duration_s || estimatedDuration, 0).toFixed(2)} s`
+          }
         />
         <MetricCard
           label="当前频率"
@@ -964,7 +1125,7 @@ export default function OdmrPage() {
               <Select
                 label="扫描模式"
                 value={odmrForm.scan_mode}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, scan_mode: value || "software_sync" }))}
+                onChange={(value) => patchOdmrForm((prev) => ({ ...prev, scan_mode: value || "software_sync" }))}
                 data={[
                   { value: "software_sync", label: "软件同步" },
                   { value: "aux_map", label: "Aux1 映射" },
@@ -973,7 +1134,7 @@ export default function OdmrPage() {
               <Select
                 label="读出源"
                 value={odmrForm.readout_source}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, readout_source: value || "r_v" }))}
+                onChange={(value) => patchOdmrForm((prev) => ({ ...prev, readout_source: value || "r_v" }))}
                 data={[
                   { value: "x_v", label: "X" },
                   { value: "y_v", label: "Y" },
@@ -983,32 +1144,32 @@ export default function OdmrPage() {
               <NumberInput
                 label="起始频率 (Hz)"
                 value={odmrForm.start_hz}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, start_hz: toFiniteNumber(value, prev.start_hz) }))}
+                onChange={(value) => patchOdmrForm((prev) => ({ ...prev, start_hz: toFiniteNumber(value, prev.start_hz) }))}
               />
               <NumberInput
                 label="终止频率 (Hz)"
                 value={odmrForm.stop_hz}
-                onChange={(value) => setOdmrForm((prev) => ({ ...prev, stop_hz: toFiniteNumber(value, prev.stop_hz) }))}
+                onChange={(value) => patchOdmrForm((prev) => ({ ...prev, stop_hz: toFiniteNumber(value, prev.stop_hz) }))}
               />
               <NumberInput
                 label="点数"
                 value={odmrForm.points}
                 onChange={(value) =>
-                  setOdmrForm((prev) => ({ ...prev, points: Math.max(3, Math.round(toFiniteNumber(value, prev.points))) }))
+                  patchOdmrForm((prev) => ({ ...prev, points: Math.max(3, Math.round(toFiniteNumber(value, prev.points))) }))
                 }
               />
               <NumberInput
                 label="驻留时间 (ms)"
                 value={odmrForm.dwell_ms}
                 onChange={(value) =>
-                  setOdmrForm((prev) => ({ ...prev, dwell_ms: Math.max(0.1, toFiniteNumber(value, prev.dwell_ms)) }))
+                  patchOdmrForm((prev) => ({ ...prev, dwell_ms: Math.max(0.1, toFiniteNumber(value, prev.dwell_ms)) }))
                 }
               />
               <NumberInput
                 label="平均次数"
                 value={odmrForm.averages}
                 onChange={(value) =>
-                  setOdmrForm((prev) => ({ ...prev, averages: Math.max(1, Math.round(toFiniteNumber(value, prev.averages))) }))
+                  patchOdmrForm((prev) => ({ ...prev, averages: Math.max(1, Math.round(toFiniteNumber(value, prev.averages))) }))
                 }
               />
             </SimpleGrid>
@@ -1019,28 +1180,28 @@ export default function OdmrPage() {
                   label="Aux 最小电压 (V)"
                   value={odmrForm.aux_voltage_min_v}
                   onChange={(value) =>
-                    setOdmrForm((prev) => ({ ...prev, aux_voltage_min_v: toFiniteNumber(value, prev.aux_voltage_min_v) }))
+                    patchOdmrForm((prev) => ({ ...prev, aux_voltage_min_v: toFiniteNumber(value, prev.aux_voltage_min_v) }))
                   }
                 />
                 <NumberInput
                   label="Aux 最大电压 (V)"
                   value={odmrForm.aux_voltage_max_v}
                   onChange={(value) =>
-                    setOdmrForm((prev) => ({ ...prev, aux_voltage_max_v: toFiniteNumber(value, prev.aux_voltage_max_v) }))
+                    patchOdmrForm((prev) => ({ ...prev, aux_voltage_max_v: toFiniteNumber(value, prev.aux_voltage_max_v) }))
                   }
                 />
                 <NumberInput
                   label="映射最小频率 (Hz)"
                   value={odmrForm.aux_frequency_min_hz}
                   onChange={(value) =>
-                    setOdmrForm((prev) => ({ ...prev, aux_frequency_min_hz: toFiniteNumber(value, prev.aux_frequency_min_hz) }))
+                    patchOdmrForm((prev) => ({ ...prev, aux_frequency_min_hz: toFiniteNumber(value, prev.aux_frequency_min_hz) }))
                   }
                 />
                 <NumberInput
                   label="映射最大频率 (Hz)"
                   value={odmrForm.aux_frequency_max_hz}
                   onChange={(value) =>
-                    setOdmrForm((prev) => ({ ...prev, aux_frequency_max_hz: toFiniteNumber(value, prev.aux_frequency_max_hz) }))
+                    patchOdmrForm((prev) => ({ ...prev, aux_frequency_max_hz: toFiniteNumber(value, prev.aux_frequency_max_hz) }))
                   }
                 />
               </SimpleGrid>
@@ -1049,6 +1210,17 @@ export default function OdmrPage() {
             <Group mt="lg">
               <Button variant="light" color="gray" onClick={syncFromMicrowave}>从微波页同步</Button>
               <Button variant="light" color="gray" onClick={syncReadoutFromLockin}>跟随锁相读出</Button>
+              <Button
+                color="cyan"
+                variant={odmrConfigConfirmed ? "light" : "filled"}
+                onClick={confirmOdmrConfig}
+                disabled={isOdmrRunning}
+              >
+                确认配置
+              </Button>
+              <Badge variant="light" color={odmrConfigConfirmed ? "teal" : "yellow"}>
+                {odmrConfigConfirmed ? "配置已确认" : "配置未确认"}
+              </Badge>
             </Group>
             <Group mt="md">
               <Button variant="light" color="gray" onClick={exportTrace} disabled={!trace.frequency_hz?.length}>
@@ -1059,7 +1231,11 @@ export default function OdmrPage() {
               </Button>
             </Group>
             <Group mt="md">
-              <Button onClick={runOdmr} loading={isOdmrRunning} disabled={isMeasurementRunning && !isOdmrRunning}>
+              <Button
+                onClick={runOdmr}
+                loading={isOdmrRunning}
+                disabled={(isMeasurementRunning && !isOdmrRunning) || !odmrConfigConfirmed}
+              >
                 开始扫描
               </Button>
               <Button color="red" variant="light" onClick={stopOdmr} disabled={!isOdmrRunning}>
@@ -1080,6 +1256,41 @@ export default function OdmrPage() {
                 hint={`最小 ${formatScientific(yMin, 3)} | 最大 ${formatScientific(yMax, 3)}`}
               />
             </SimpleGrid>
+
+            <SimpleGrid cols={{ base: 1, md: 2, lg: 4 }} mt="md">
+              <MetricCard
+                label="已用时间"
+                value={formatElapsedSeconds(odmrElapsedS)}
+                hint={isOdmrRunning ? "扫频进行中（墙钟）" : odmrLastTotalS != null ? "上一轮结束时的值" : "开始扫描后计时"}
+              />
+              <MetricCard
+                label="预计剩余"
+                value={isOdmrRunning && odmrEtaS != null ? formatElapsedSeconds(odmrEtaS) : "--"}
+                hint="按已扫点线性外推，含写频与读数"
+              />
+              <MetricCard
+                label="dwell 预计总时长"
+                value={formatElapsedSeconds(
+                  isOdmrRunning || estimatedDuration > 0
+                    ? estimatedDuration || estimateOdmrDwellSeconds(odmrForm)
+                    : estimateOdmrDwellSeconds(odmrForm)
+                )}
+                hint={`仅 points×dwell ≈ ${odmrForm.points} × ${Number(odmrForm.dwell_ms).toFixed(1)} ms，不含仪器 I/O`}
+              />
+              <MetricCard
+                label="本轮总耗时"
+                value={odmrLastTotalS != null ? formatElapsedSeconds(odmrLastTotalS) : "--"}
+                hint={
+                  odmrLastTotalS != null && estimatedDuration > 0
+                    ? `实测 / dwell 预计 = ${(odmrLastTotalS / Math.max(estimatedDuration, 1e-9)).toFixed(2)}×`
+                    : "完成或停止后显示"
+                }
+              />
+            </SimpleGrid>
+            <Text c="dimmed" size="sm" mt="sm">
+              软件同步 ODMR 为逐点：写微波频率 → 等待 dwell → 读锁相。LabOne 单独扫频多为仪器/DAQ
+              流水线，通常更快。本页「已用时间」为从扫频开始到结束的真实墙钟计时。
+            </Text>
           </SectionCard>
         </Grid.Col>
 

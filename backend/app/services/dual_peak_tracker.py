@@ -36,6 +36,138 @@ class GlobalState(str, Enum):
     STOPPED = "STOPPED"
 
 
+class CurrentTrackingError(RuntimeError):
+    """Structured failure for dual-peak tracking (stage + code + operator hint)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        code: str,
+        hint: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.stage = str(stage)
+        self.code = str(code)
+        self.hint = str(hint or "")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "message": str(self),
+            "failed_stage": self.stage,
+            "error_code": self.code,
+            "hint": self.hint,
+        }
+
+
+def classify_current_tracking_failure(message: str) -> dict[str, str]:
+    """Map free-form error text to stage/code/hint for UI and metadata."""
+    text = str(message or "").strip()
+    lower = text.lower()
+
+    rules: list[tuple[tuple[str, ...], str, str, str]] = [
+        (
+            ("未发现两个可靠", "左瓣-谷-右瓣", "fm 左瓣"),
+            "full_scan",
+            "no_two_lobes",
+            "检查 1f FM、扫频是否包住双峰，并增加搜索点数/驻留；峰心必须是双瓣夹谷的谷底。",
+        ),
+        (
+            ("存在歧义", "拒绝猜测"),
+            "full_scan",
+            "pair_ambiguous",
+            "收紧起始/终止频率或 Δf 范围，减少杂峰；勿盲目再降歧义比以免跟错峰对。",
+        ),
+        (
+            ("斜率同向", "复数斜率"),
+            "full_scan",
+            "pair_phase",
+            "检查 FM 相位/解调；假谷（两共振之间）会被斜率反向剔除，属正常保护。",
+        ),
+        (
+            ("未找到满足", "δf 范围", "Δf 范围"),
+            "full_scan",
+            "pair_delta_f",
+            "调整 delta_f_min/max 或扫频范围，使真实劈裂落在窗口内。",
+        ),
+        (
+            ("间距小于可分辨", "可分辨阈值"),
+            "full_scan",
+            "pair_unresolved",
+            "两峰过近或分辨率不足：增大 search_points，或略降 minimum_resolvable_separation_factor。",
+        ),
+        (
+            ("完整扫频包含无效", "无效采样"),
+            "full_scan",
+            "scan_invalid_samples",
+            "检查锁相/微波连接与驻留时间，避免扫频点上出现 NaN。",
+        ),
+        (
+            ("左峰不小于右峰", "身份分配失败"),
+            "full_scan",
+            "identity_order",
+            "扫频结果异常，请重扫或收紧范围后重试。",
+        ),
+        (
+            ("r²", "r2", "复数鉴频模型"),
+            "calibrate",
+            "fit_r2",
+            "略降 minimum_complex_fit_r2，或调整 probe_offset / 每点稳定等待；峰心定义不变。",
+        ),
+        (
+            ("斜率过小", "标定窗口无效", "复数标定"),
+            "calibrate",
+            "fit_slope",
+            "检查 FM 深度与探测偏移；确认谷心附近 X/Y 有线性斜率。",
+        ),
+        (
+            ("全频段重捕获次数", "重捕获次数超过"),
+            "track",
+            "max_relock",
+            "增大 max_relock_attempts，或排查信号漂移/范围是否仍包住双峰。",
+        ),
+        (
+            ("锁相未连接",),
+            "setup",
+            "lockin_disconnected",
+            "请先在设备页连接锁相。",
+        ),
+        (
+            ("微波源未连接", "微波", "捷变频"),
+            "setup",
+            "microwave_unavailable",
+            "请先连接微波源并确认快速捷变频可用。",
+        ),
+        (
+            ("终止频率必须大于",),
+            "setup",
+            "bad_range",
+            "将终止频率设为大于起始频率。",
+        ),
+        (
+            ("已停止",),
+            "track",
+            "cancelled",
+            "用户或系统请求停止。",
+        ),
+    ]
+    for needles, stage, code, hint in rules:
+        if any(needle in text or needle in lower for needle in needles):
+            return {
+                "message": text or "未知错误",
+                "failed_stage": stage,
+                "error_code": code,
+                "hint": hint,
+            }
+    return {
+        "message": text or "未知错误",
+        "failed_stage": "unknown",
+        "error_code": "unknown",
+        "hint": "查看完整报错；确认 FM 双瓣夹谷结构清晰且范围包住两峰。",
+    }
+
+
 @dataclass
 class ComplexPeakModel:
     center_reference_hz: float

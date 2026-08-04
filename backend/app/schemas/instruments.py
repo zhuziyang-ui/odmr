@@ -54,20 +54,27 @@ class MicrowaveConnectRequest(BaseModel):
 
 
 class MicrowaveConfigRequest(BaseModel):
-    mode: Literal["cw", "sweep"] = "cw"
+    mode: Literal["cw", "sweep"] = "sweep"
+    # How instrument LIST/STEP sweep runs when mode=sweep:
+    # - trigger: arm single-shot (INIT:CONT OFF); use Trigger API/button for one pass
+    # - free: free-run continuous sweep (INIT:CONT ON) after apply
+    sweep_run_mode: Literal["trigger", "free"] = "trigger"
     frequency_hz: float = 2.87e9
     center_frequency_hz: float = 2.87e9
     sweep_start_hz: float = 2.82e9
     sweep_stop_hz: float = 2.92e9
-    sweep_points: int = Field(default=101, ge=2, le=5000)
+    # Primary user input for sweep density; points are derived from start/stop/step.
+    sweep_step_hz: float = Field(default=10_000.0, gt=0.0)
+    # Derived/output field used by Keysight SCPI and ODMR sync. Recomputed from step on apply.
+    sweep_points: int = Field(default=10001, ge=2, le=65535)
     dwell_ms: float = Field(default=5.0, ge=0.1)
-    power_dbm: float = -10.0
+    power_dbm: float = 18.0
     output_enabled: bool = False
     iq_enabled: bool = False
     fm_enabled: bool = False
     fm_source: Literal["internal", "external"] = "external"
-    fm_deviation_hz: float = 100_000.0
-    fm_rate_hz: float = 1_000.0
+    fm_deviation_hz: float = 3_000_000.0
+    fm_rate_hz: float = 10_000.0
     lf_output_enabled: bool = False
     lf_output_source: Literal["monitor", "function1", "dc"] = "monitor"
     lf_output_amplitude_v: float = 1.0
@@ -120,9 +127,10 @@ class CurrentTrackingRequest(BaseModel):
     start_hz: float = Field(default=2.83e9)
     stop_hz: float = Field(default=2.91e9)
     search_points: int = Field(default=121, ge=11, le=4001)
-    search_settle_ms: float = Field(default=10.0, ge=0.1, le=5000.0)
+    # Defaults = 稳健 preset: looser noise thresholds, same lobe–valley–lobe peak definition.
+    search_settle_ms: float = Field(default=15.0, ge=0.1, le=5000.0)
     probe_offset_hz: float = Field(default=250_000.0, gt=0.0)
-    tracking_settle_ms: float = Field(default=3.0, ge=0.1, le=5000.0)
+    tracking_settle_ms: float = Field(default=5.0, ge=0.1, le=5000.0)
     sample_averages: int = Field(default=1, ge=1, le=100)
     timing_report_interval_cycles: int = Field(default=10, ge=1, le=10000)
     record_enabled: bool = True
@@ -137,19 +145,19 @@ class CurrentTrackingRequest(BaseModel):
     maximum_slew_hz_per_s: float = Field(default=10_000_000.0, gt=0.0)
     integral_limit_hz: float = Field(default=1_000_000.0, ge=0.0)
     lock_error_limit_hz: float = Field(default=1_500_000.0, gt=0.0)
-    minimum_complex_fit_r2: float = Field(default=0.7, ge=0.0, le=1.0)
+    minimum_complex_fit_r2: float = Field(default=0.5, ge=0.0, le=1.0)
     slope_epsilon: float = Field(default=1e-30, gt=0.0)
-    orthogonal_limit_fraction: float = Field(default=0.5, gt=0.0)
-    maximum_error_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
+    orthogonal_limit_fraction: float = Field(default=0.8, gt=0.0)
+    maximum_error_fraction: float = Field(default=0.95, gt=0.0, le=1.0)
     minimum_depth_fraction: float = Field(default=0.15, ge=0.0, le=1.0)
-    slope_ratio_min: float = Field(default=0.3, gt=0.0)
-    slope_ratio_max: float = Field(default=3.0, gt=0.0)
-    maximum_slope_angle_change_rad: float = Field(default=1.0, gt=0.0)
-    verify_interval_visits: int = Field(default=20, ge=1, le=100000)
-    slope_verification_max_age_s: float = Field(default=10.0, gt=0.0)
-    bad_samples_to_suspect: int = Field(default=1, ge=1, le=1000)
-    bad_samples_to_lose: int = Field(default=3, ge=1, le=1000)
-    good_samples_to_lock: int = Field(default=3, ge=1, le=1000)
+    slope_ratio_min: float = Field(default=0.2, gt=0.0)
+    slope_ratio_max: float = Field(default=5.0, gt=0.0)
+    maximum_slope_angle_change_rad: float = Field(default=1.3, gt=0.0)
+    verify_interval_visits: int = Field(default=10, ge=1, le=100000)
+    slope_verification_max_age_s: float = Field(default=25.0, gt=0.0)
+    bad_samples_to_suspect: int = Field(default=3, ge=1, le=1000)
+    bad_samples_to_lose: int = Field(default=6, ge=1, le=1000)
+    good_samples_to_lock: int = Field(default=2, ge=1, le=1000)
     relock_gain_ramp_samples: int = Field(default=5, ge=1, le=1000)
     saturation_loss_threshold: int = Field(default=5, ge=1, le=1000)
     calibration_points_each_side: int = Field(default=2, ge=1, le=10)
@@ -167,10 +175,10 @@ class CurrentTrackingRequest(BaseModel):
     local_scan_max_expansions: int = Field(default=3, ge=1, le=20)
     reacquire_identity_guard_fraction: float = Field(default=0.25, ge=0.0, le=2.0)
     minimum_resolvable_separation_factor: float = Field(default=0.75, ge=0.0, le=10.0)
-    minimum_peak_prominence_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
-    peak_pair_ambiguity_score_ratio: float = Field(default=0.9, gt=0.0, le=1.0)
+    minimum_peak_prominence_fraction: float = Field(default=0.03, ge=0.0, le=1.0)
+    peak_pair_ambiguity_score_ratio: float = Field(default=0.75, gt=0.0, le=1.0)
     relock_cooldown_s: float = Field(default=0.1, ge=0.0, le=60.0)
-    max_relock_attempts: int = Field(default=5, ge=0, le=1000)
+    max_relock_attempts: int = Field(default=10, ge=0, le=1000)
     max_tracking_duration_s: float = Field(default=0.0, ge=0.0, le=604800.0)
     minimum_calibration_slope_a_per_hz: float | None = None
     minimum_calibration_intercept_a: float | None = None

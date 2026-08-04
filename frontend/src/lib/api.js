@@ -74,6 +74,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  triggerMicrowaveSweep: () =>
+    request("/instruments/microwave/sweep/trigger", {
+      method: "POST",
+    }),
+  stopMicrowaveSweep: () =>
+    request("/instruments/microwave/sweep/stop", {
+      method: "POST",
+    }),
   runOdmr: (payload) =>
     request("/measurement/odmr", {
       method: "POST",

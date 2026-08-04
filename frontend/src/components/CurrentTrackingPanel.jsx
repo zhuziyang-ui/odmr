@@ -5,6 +5,7 @@ import {
   Grid,
   Group,
   NumberInput,
+  Select,
   SimpleGrid,
   Stack,
   Switch,
@@ -18,13 +19,82 @@ import { MetricCard } from "./MetricCard";
 import { PlotCard } from "./PlotCard";
 import { SectionCard } from "./SectionCard";
 
-const MAX_TRACKING_POINTS = 400;
+/** 内存最多保留最近 1 h；显示窗口再二次过滤。 */
+const PLOT_BUFFER_KEEP_S = 3600;
+const PLOT_WINDOW_STORAGE_KEY = "nv-live-plot-window-s-v1";
+const PLOT_WINDOW_OPTIONS = [
+  { value: "2", label: "2 s", seconds: 2 },
+  { value: "10", label: "10 s", seconds: 10 },
+  { value: "60", label: "60 s", seconds: 60 },
+  { value: "300", label: "5 min", seconds: 300 },
+  { value: "3600", label: "1 h", seconds: 3600 },
+];
+const MAX_BUFFER_POINTS = 50000;
 
-const DEFAULT_TRACKING_FORM = {
+function plotNumberOr(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function loadPlotWindowSeconds() {
+  if (typeof window === "undefined") {
+    return 60;
+  }
+  try {
+    const raw = window.localStorage.getItem(PLOT_WINDOW_STORAGE_KEY);
+    const match = PLOT_WINDOW_OPTIONS.find((item) => item.value === String(raw));
+    if (match) {
+      return match.seconds;
+    }
+  } catch {
+    // ignore
+  }
+  return 60;
+}
+
+function persistPlotWindowSeconds(seconds) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(PLOT_WINDOW_STORAGE_KEY, String(seconds));
+  } catch {
+    // ignore
+  }
+}
+
+function appendTrackingPoint(previous, point) {
+  const tEnd = plotNumberOr(point?.elapsed_s, NaN);
+  const next = [...(Array.isArray(previous) ? previous : []), point];
+  if (!Number.isFinite(tEnd)) {
+    return next.length > MAX_BUFFER_POINTS ? next.slice(-MAX_BUFFER_POINTS) : next;
+  }
+  const kept = next.filter(
+    (item) => tEnd - plotNumberOr(item?.elapsed_s, tEnd) <= PLOT_BUFFER_KEEP_S
+  );
+  return kept.length > MAX_BUFFER_POINTS ? kept.slice(-MAX_BUFFER_POINTS) : kept;
+}
+
+function slicePointsByWindow(points, windowSeconds) {
+  const list = Array.isArray(points) ? points : [];
+  if (!list.length) {
+    return { points: [], xRange: undefined };
+  }
+  const tEnd = plotNumberOr(list[list.length - 1]?.elapsed_s, 0);
+  const windowS = Math.max(1, plotNumberOr(windowSeconds, 60));
+  const tStart = tEnd - windowS;
+  const visible = list.filter((item) => plotNumberOr(item?.elapsed_s, -Infinity) >= tStart);
+  return {
+    points: visible,
+    xRange: [Math.max(0, tStart), Math.max(tEnd, tStart + 1e-3)],
+  };
+}
+
+/** Shared base; peak center is always FM 1f lobe–valley–lobe valley minimum. */
+const TRACKING_FORM_BASE = {
   tracking_target: "complex_projection",
   independent_dc_channel_index: -1,
   probe_offset_hz: 250_000,
-  tracking_settle_ms: 3,
   sample_averages: 1,
   timing_report_interval_cycles: 10,
   record_enabled: true,
@@ -39,18 +109,7 @@ const DEFAULT_TRACKING_FORM = {
   maximum_slew_hz_per_s: 10_000_000,
   integral_limit_hz: 1_000_000,
   lock_error_limit_hz: 1_500_000,
-  minimum_complex_fit_r2: 0.7,
-  orthogonal_limit_fraction: 0.5,
-  maximum_error_fraction: 0.8,
   minimum_depth_fraction: 0.15,
-  slope_ratio_min: 0.3,
-  slope_ratio_max: 3,
-  maximum_slope_angle_change_rad: 1,
-  verify_interval_visits: 20,
-  slope_verification_max_age_s: 10,
-  bad_samples_to_suspect: 1,
-  bad_samples_to_lose: 3,
-  good_samples_to_lock: 3,
   relock_gain_ramp_samples: 5,
   saturation_loss_threshold: 5,
   calibration_points_each_side: 2,
@@ -69,9 +128,134 @@ const DEFAULT_TRACKING_FORM = {
   reacquire_identity_guard_fraction: 0.25,
   minimum_resolvable_separation_factor: 0.75,
   relock_cooldown_s: 0.1,
-  max_relock_attempts: 5,
   max_tracking_duration_s: 0,
 };
+
+/** 稳健：默认更易进锁；不改变双瓣夹谷峰心定义。 */
+const PRESET_ROBUST = {
+  tracking_settle_ms: 5,
+  minimum_complex_fit_r2: 0.5,
+  orthogonal_limit_fraction: 0.8,
+  maximum_error_fraction: 0.95,
+  slope_ratio_min: 0.2,
+  slope_ratio_max: 5,
+  maximum_slope_angle_change_rad: 1.3,
+  verify_interval_visits: 10,
+  slope_verification_max_age_s: 25,
+  bad_samples_to_suspect: 3,
+  bad_samples_to_lose: 6,
+  good_samples_to_lock: 2,
+  minimum_peak_prominence_fraction: 0.03,
+  peak_pair_ambiguity_score_ratio: 0.75,
+  max_relock_attempts: 10,
+};
+
+/** 标准：历史默认量级。 */
+const PRESET_STANDARD = {
+  tracking_settle_ms: 3,
+  minimum_complex_fit_r2: 0.7,
+  orthogonal_limit_fraction: 0.5,
+  maximum_error_fraction: 0.8,
+  slope_ratio_min: 0.3,
+  slope_ratio_max: 3,
+  maximum_slope_angle_change_rad: 1,
+  verify_interval_visits: 20,
+  slope_verification_max_age_s: 10,
+  bad_samples_to_suspect: 1,
+  bad_samples_to_lose: 3,
+  good_samples_to_lock: 3,
+  minimum_peak_prominence_fraction: 0.05,
+  peak_pair_ambiguity_score_ratio: 0.9,
+  max_relock_attempts: 5,
+};
+
+/** 严格：干净信号、低误跟。 */
+const PRESET_STRICT = {
+  tracking_settle_ms: 3,
+  minimum_complex_fit_r2: 0.85,
+  orthogonal_limit_fraction: 0.4,
+  maximum_error_fraction: 0.7,
+  slope_ratio_min: 0.5,
+  slope_ratio_max: 2,
+  maximum_slope_angle_change_rad: 0.8,
+  verify_interval_visits: 15,
+  slope_verification_max_age_s: 8,
+  bad_samples_to_suspect: 1,
+  bad_samples_to_lose: 2,
+  good_samples_to_lock: 4,
+  minimum_peak_prominence_fraction: 0.08,
+  peak_pair_ambiguity_score_ratio: 0.95,
+  max_relock_attempts: 5,
+};
+
+const TRACKING_PRESETS = {
+  robust: { label: "稳健（推荐）", searchSettleMs: 15, values: PRESET_ROBUST },
+  standard: { label: "标准", searchSettleMs: 10, values: PRESET_STANDARD },
+  strict: { label: "严格", searchSettleMs: 10, values: PRESET_STRICT },
+};
+
+/** 界面模式：只控制显示哪些控件，不改变数值。 */
+const UI_MODE_STORAGE_KEY = "nv-current-tracking-ui-mode-v1";
+const UI_MODES = {
+  simple: { label: "简易（推荐）", level: 0 },
+  tuning: { label: "调机", level: 1 },
+  expert: { label: "专家", level: 2 },
+};
+
+function loadUiMode() {
+  if (typeof window === "undefined") {
+    return "simple";
+  }
+  try {
+    const stored = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
+    if (stored && UI_MODES[stored]) {
+      return stored;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return "simple";
+}
+
+function persistUiMode(mode) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(UI_MODE_STORAGE_KEY, mode);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function uiModeLevel(mode) {
+  return UI_MODES[mode]?.level ?? 0;
+}
+
+const DEFAULT_TRACKING_FORM = {
+  ...TRACKING_FORM_BASE,
+  ...PRESET_ROBUST,
+};
+
+const STAGE_LABELS = {
+  setup: "启动检查",
+  full_scan: "全频扫峰",
+  calibrate: "复数标定",
+  track: "闭环跟踪",
+  local_reacquire: "局部重捕获",
+  unknown: "未知阶段",
+};
+
+function formatTrackingFailure(payload) {
+  const message = payload?.message || "后端返回未知错误。";
+  const stage = payload?.failed_stage
+    ? STAGE_LABELS[payload.failed_stage] || payload.failed_stage
+    : "";
+  const hint = payload?.hint || "";
+  const code = payload?.error_code ? ` [${payload.error_code}]` : "";
+  const head = stage ? `${stage}${code}：${message}` : `${message}${code}`;
+  return hint ? `${head}\n建议：${hint}` : head;
+}
 
 function numberOr(value, fallback = 0) {
   const numeric = Number(value);
@@ -138,6 +322,40 @@ function targetLabel(target) {
   return "自动";
 }
 
+/** 输出 invalid_reason → 简短中文（简易/调机可读） */
+function invalidReasonLabel(reason) {
+  if (!reason) {
+    return "等待锁定";
+  }
+  const map = {
+    both_peaks_not_locked: "双峰未同时 LOCKED",
+    peak_identity_invalid: "左右峰身份异常",
+    delta_f_outside_physical_range: "Δf 超出物理范围",
+    delta_f_uncertainty_too_large: "Δf 不确定度过大",
+    current_outside_calibration_range: "Δf 超出标定范围",
+    current_calibration_missing: "缺少电流标定（≥2 点）",
+    full_reacquire: "正在全频重捕获",
+    full_scan: "正在全频扫峰",
+    calibrating_complex_models: "正在标定复数模型",
+  };
+  return map[reason] || String(reason);
+}
+
+function peakStateLabel(state) {
+  if (!state) {
+    return "--";
+  }
+  const map = {
+    UNINITIALIZED: "未初始化",
+    ACQUIRING: "捕获中",
+    LOCKED: "已锁定",
+    SUSPECT: "可疑",
+    LOCAL_REACQUIRE: "局部重捕",
+    LOST: "丢失",
+  };
+  return map[state] || state;
+}
+
 function lockLabel(state) {
   const labels = {
     idle: "待机",
@@ -184,7 +402,7 @@ function formatMs(value) {
 export function CurrentTrackingPanel({
   currentForm,
   onCurrentFormChange,
-  onSyncFromOdmr,
+  onSyncFromMicrowave,
   onUseDefaultResonance,
   calibrationPoints,
   onAddPhysicalCalibrationPoint,
@@ -193,6 +411,11 @@ export function CurrentTrackingPanel({
   measurementBusy,
 }) {
   const [form, setForm] = useState(DEFAULT_TRACKING_FORM);
+  const [sensitivityPreset, setSensitivityPreset] = useState("robust");
+  const [uiMode, setUiMode] = useState(loadUiMode);
+  const [plotWindowS, setPlotWindowS] = useState(loadPlotWindowSeconds);
+  const [selectedPair, setSelectedPair] = useState(null);
+  const [configConfirmed, setConfigConfirmed] = useState(false);
   const [isTracking, setIsTracking] = useState(false);
   const [lockState, setLockState] = useState("idle");
   const [statusText, setStatusText] = useState("等待启动");
@@ -207,6 +430,109 @@ export function CurrentTrackingPanel({
   const [timingDiagnostics, setTimingDiagnostics] = useState(null);
   const [recordingStatus, setRecordingStatus] = useState(null);
   const [isDownloadingRecording, setIsDownloadingRecording] = useState(false);
+
+  const applySensitivityPreset = (presetKey) => {
+    const preset = TRACKING_PRESETS[presetKey] || TRACKING_PRESETS.robust;
+    setSensitivityPreset(presetKey);
+    setForm((previous) => ({
+      ...previous,
+      ...preset.values,
+    }));
+    setConfigConfirmed(false);
+    if (currentForm && onCurrentFormChange) {
+      onCurrentFormChange({
+        ...currentForm,
+        settle_ms: preset.searchSettleMs,
+      });
+    }
+  };
+
+  const changeUiMode = (mode) => {
+    const next = UI_MODES[mode] ? mode : "simple";
+    setUiMode(next);
+    persistUiMode(next);
+    // 仅改可见性，不清「配置已确认」、不改数值
+  };
+
+  const showTuning = uiModeLevel(uiMode) >= 1;
+  const showExpert = uiModeLevel(uiMode) >= 2;
+
+  const markConfigDirty = () => setConfigConfirmed(false);
+
+  const patchForm = (updater) => {
+    markConfigDirty();
+    setForm(updater);
+  };
+
+  const confirmCurrentConfig = () => {
+    if (!currentForm) {
+      notifications.show({
+        color: "red",
+        title: "无法确认",
+        message: "捕获范围表单尚未就绪。",
+      });
+      return false;
+    }
+    const startHz = numberOr(currentForm.start_hz, NaN);
+    const stopHz = numberOr(currentForm.stop_hz, NaN);
+    const searchPoints = Math.round(numberOr(currentForm.search_points, 0));
+    const settleMs = numberOr(currentForm.settle_ms, NaN);
+    if (!(Number.isFinite(startHz) && Number.isFinite(stopHz) && stopHz > startHz)) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "起始频率必须小于终止频率。",
+      });
+      return false;
+    }
+    if (!(searchPoints >= 11)) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "搜索点数至少为 11。",
+      });
+      return false;
+    }
+    if (!(settleMs > 0)) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "初始扫频稳定等待必须大于 0。",
+      });
+      return false;
+    }
+    if (!(numberOr(form.probe_offset_hz) > 0)) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "复数模型/斜率探测偏移必须大于 0。",
+      });
+      return false;
+    }
+    if (form.bad_samples_to_lose < form.bad_samples_to_suspect) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "进入重捕获的坏样本数不能小于进入可疑的坏样本数。",
+      });
+      return false;
+    }
+    if (!(form.slope_ratio_max > form.slope_ratio_min)) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: "斜率比上限必须大于下限。",
+      });
+      return false;
+    }
+    setConfigConfirmed(true);
+    notifications.show({
+      color: "teal",
+      title: "配置已确认",
+      message: `捕获 ${(startHz / 1e9).toFixed(4)}–${(stopHz / 1e9).toFixed(4)} GHz，${searchPoints} 点，驻留 ${settleMs.toFixed(1)} ms；灵敏度预设=${TRACKING_PRESETS[sensitivityPreset]?.label || sensitivityPreset}`,
+    });
+    return true;
+  };
   const socketRef = useRef(null);
 
   useEffect(
@@ -234,7 +560,7 @@ export function CurrentTrackingPanel({
   }, []);
 
   const updateNumber = (field, minimum = 0) => (value) => {
-    setForm((previous) => ({
+    patchForm((previous) => ({
       ...previous,
       [field]: Math.max(minimum, numberOr(value, previous[field])),
     }));
@@ -282,6 +608,14 @@ export function CurrentTrackingPanel({
       });
       return;
     }
+    if (!configConfirmed) {
+      notifications.show({
+        color: "yellow",
+        title: "请先确认配置",
+        message: "修改参数后需点击「确认配置」，校验通过后再启动跟踪。",
+      });
+      return;
+    }
     if (!canConvertSelectedTarget) {
       notifications.show({
         color: "yellow",
@@ -298,6 +632,7 @@ export function CurrentTrackingPanel({
     setCapabilityWarning("");
     setTimingDiagnostics(null);
     setRecordingStatus(null);
+    setSelectedPair(null);
     setLockState("connecting");
     setStatusText("正在连接跟踪通道");
     const socket = new WebSocket(wsUrl("/measurement/current/tracking/ws"));
@@ -350,6 +685,16 @@ export function CurrentTrackingPanel({
               : state === "CALIBRATE"
                 ? "正在标定左右峰复数 b/g 模型"
                 : "正在执行完整 FM R 双瓣谷扫频"
+          );
+        } else if (payload.type === "current_tracking_pair_selected") {
+          setSelectedPair({
+            left_center_hz: payload.left_center_hz,
+            right_center_hz: payload.right_center_hz,
+            separation_hz: payload.separation_hz,
+            selection_rule: payload.selection_rule,
+          });
+          setStatusText(
+            `已选双瓣谷心：左 ${formatGHz(payload.left_center_hz)} / 右 ${formatGHz(payload.right_center_hz)}（规则：双瓣夹谷最低点）`
           );
         } else if (payload.type === "current_tracking_models_calibrated") {
           setActiveTarget("complex_projection");
@@ -414,7 +759,7 @@ export function CurrentTrackingPanel({
           setRelockCount(numberOr(point.relock_count, 0));
           setWarningReasons(point.valid || !point.invalid_reason ? [] : [point.invalid_reason]);
           setStatusText(point.valid ? "双峰可靠锁定，输出有效" : `输出无效：${point.invalid_reason || "等待锁定"}`);
-          setPoints((previous) => [...previous, point].slice(-MAX_TRACKING_POINTS));
+          setPoints((previous) => appendTrackingPoint(previous, point));
         } else if (payload.type === "current_tracking_lock_warning") {
           setLockState("warning");
           setWarningReasons(Array.isArray(payload.reasons) ? payload.reasons : []);
@@ -445,11 +790,15 @@ export function CurrentTrackingPanel({
         } else if (payload.type === "current_tracking_error") {
           setIsTracking(false);
           setLockState("error");
-          setStatusText(payload.message || "PID 双峰跟踪失败");
+          const detail = formatTrackingFailure(payload);
+          setStatusText(detail.replace(/\n/g, " · "));
           notifications.show({
             color: "red",
-            title: "PID 跟踪失败",
-            message: payload.message || "后端返回未知错误。",
+            title: payload.failed_stage
+              ? `PID 跟踪失败 · ${STAGE_LABELS[payload.failed_stage] || payload.failed_stage}`
+              : "PID 跟踪失败",
+            message: detail,
+            autoClose: 12000,
           });
           closeSocket();
         }
@@ -489,6 +838,7 @@ export function CurrentTrackingPanel({
   };
 
   const updateCurrentNumber = (field, minimum = null, integer = false) => (value) => {
+    markConfigDirty();
     const previousValue = currentForm?.[field];
     let numeric = numberOr(value, previousValue);
     if (integer) {
@@ -569,10 +919,20 @@ export function CurrentTrackingPanel({
     });
   };
 
-  const elapsed = points.map((point) => numberOr(point.elapsed_s));
-  const leftGHz = points.map((point) => numberOr(point.left_frequency_hz) / 1e9);
-  const rightGHz = points.map((point) => numberOr(point.right_frequency_hz) / 1e9);
-  const currentMa = points.map((point) => numberOr(point.estimated_current_a, NaN) * 1e3);
+  const plotSlice = slicePointsByWindow(points, plotWindowS);
+  const plotPoints = plotSlice.points;
+  const plotXRange = plotSlice.xRange;
+  const elapsed = plotPoints.map((point) => numberOr(point.elapsed_s));
+  const leftGHz = plotPoints.map((point) => numberOr(point.left_frequency_hz) / 1e9);
+  const rightGHz = plotPoints.map((point) => numberOr(point.right_frequency_hz) / 1e9);
+  const currentMa = plotPoints.map((point) => numberOr(point.estimated_current_a, NaN) * 1e3);
+
+  const changePlotWindow = (value) => {
+    const match = PLOT_WINDOW_OPTIONS.find((item) => item.value === String(value));
+    const seconds = match?.seconds ?? 60;
+    setPlotWindowS(seconds);
+    persistPlotWindowSeconds(seconds);
+  };
   const leftPid = latestPoint?.left_pid || {};
   const rightPid = latestPoint?.right_pid || {};
   const saturated = Boolean(leftPid.saturated || rightPid.saturated);
@@ -589,7 +949,7 @@ export function CurrentTrackingPanel({
   return (
     <SectionCard
       title="PID 闭环双峰连续跟踪"
-      description="按 FM 1f 解调后的 R≈|dS/df|，用每个共振的左瓣—谷—右瓣定义物理峰心；再在峰心附近拟合独立复数 b/g 模型，将 X+jY 投影成有符号 Hz 误差，按 L→R 交替驱动两个受限 PID。"
+      description="峰心定义（不可改）：FM 1f 双瓣夹谷的最低谷底。用「界面模式」控制显示多少参数；用「灵敏度预设」控制门限松紧。两者独立，隐藏参数仍会按当前值提交。"
       badge={lockLabel(lockState)}
     >
       <Group mb="md">
@@ -603,16 +963,60 @@ export function CurrentTrackingPanel({
       {capabilityWarning ? (
         <Text c="yellow" size="sm" mb="md">{capabilityWarning}</Text>
       ) : null}
+      {selectedPair ? (
+        <Text c="teal" size="sm" mb="md">
+          当前候选双瓣谷心：{formatGHz(selectedPair.left_center_hz)} /{" "}
+          {formatGHz(selectedPair.right_center_hz)}
+          {Number.isFinite(Number(selectedPair.separation_hz))
+            ? `，Δf ${formatMHz(selectedPair.separation_hz)}`
+            : ""}
+          （selection_rule={selectedPair.selection_rule || "fm_lobe_valley_lobe_minima"}）
+        </Text>
+      ) : null}
+
+      <SimpleGrid cols={{ base: 1, md: 2 }} mb="md">
+        <Select
+          label="界面模式"
+          description="只控制显示多少参数，不改数值。日常用简易即可。"
+          value={uiMode}
+          disabled={isTracking}
+          data={Object.entries(UI_MODES).map(([value, item]) => ({
+            value,
+            label: item.label,
+          }))}
+          onChange={(value) => changeUiMode(value || "simple")}
+        />
+        <Select
+          label="灵敏度预设"
+          description="稳健更易进锁；严格更抗误跟。均不改变双瓣夹谷峰心定义。"
+          value={sensitivityPreset}
+          disabled={isTracking}
+          data={Object.entries(TRACKING_PRESETS).map(([value, item]) => ({
+            value,
+            label: item.label,
+          }))}
+          onChange={(value) => applySensitivityPreset(value || "robust")}
+        />
+      </SimpleGrid>
+      <Text c="dimmed" size="sm" mb="md">
+        {uiMode === "simple"
+          ? "当前为简易模式：只显示捕获范围与启停。需要拧 PID / R² 时请切到「调机」；找峰门槛等请用「专家」。"
+          : uiMode === "tuning"
+            ? "当前为调机模式：可调驻留、PID、锁定门限。隐藏参数仍用当前数值提交。"
+            : "当前为专家模式：显示全部参数。显著度/歧义只过滤候选，峰心仍是双瓣夹谷的最低谷。"}
+      </Text>
 
       <Text fw={600} mb="xs">初始双峰捕获范围</Text>
       <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
-        <NumberInput
-          label="锁相通道"
-          value={currentForm.channel_index}
-          disabled={isTracking}
-          min={0}
-          onChange={updateCurrentNumber("channel_index", 0, true)}
-        />
+        {showTuning ? (
+          <NumberInput
+            label="锁相通道"
+            value={currentForm.channel_index}
+            disabled={isTracking}
+            min={0}
+            onChange={updateCurrentNumber("channel_index", 0, true)}
+          />
+        ) : null}
         <NumberInput
           label="起始频率 (Hz)"
           value={currentForm.start_hz}
@@ -639,228 +1043,448 @@ export function CurrentTrackingPanel({
           min={0.1}
           onChange={updateCurrentNumber("settle_ms", 0.1)}
         />
-        <NumberInput
-          label="独立 DC/峰存在性通道 (-1=未配置)"
-          value={form.independent_dc_channel_index}
-          disabled={isTracking}
-          min={-1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              independent_dc_channel_index: Math.max(
-                -1,
-                Math.round(numberOr(value, previous.independent_dc_channel_index))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="复数模型/斜率探测偏移 (Hz)"
-          value={form.probe_offset_hz}
-          disabled={isTracking}
-          onChange={updateNumber("probe_offset_hz", 1)}
-        />
-        <NumberInput
-          label="每点稳定等待 (ms)"
-          value={form.tracking_settle_ms}
-          disabled={isTracking}
-          onChange={updateNumber("tracking_settle_ms", 0.1)}
-        />
-        <NumberInput
-          label="每点平均次数"
-          value={form.sample_averages}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              sample_averages: Math.max(1, Math.round(numberOr(value, previous.sample_averages))),
-            }))
-          }
-        />
-        <NumberInput
-          label="耗时分析报告间隔 (周期)"
-          value={form.timing_report_interval_cycles}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              timing_report_interval_cycles: Math.max(
-                1,
-                Math.round(numberOr(value, previous.timing_report_interval_cycles))
-              ),
-            }))
-          }
-        />
-        <NumberInput label="Kp" value={form.kp} disabled={isTracking} onChange={updateNumber("kp")} />
-        <NumberInput
-          label="Ki (1/s)"
-          value={form.ki_per_s}
-          disabled={isTracking}
-          onChange={updateNumber("ki_per_s")}
-        />
-        <NumberInput
-          label="Kd (s)"
-          value={form.kd_s}
-          disabled={isTracking}
-          onChange={updateNumber("kd_s")}
-        />
-        <NumberInput
-          label="微分滤波时间常数 (s)"
-          value={form.derivative_filter_tau_s}
-          disabled={isTracking}
-          min={0}
-          onChange={updateNumber("derivative_filter_tau_s")}
-        />
-        <NumberInput
-          label="抗饱和反算增益 (1/s)"
-          value={form.antiwindup_gain_per_s}
-          disabled={isTracking}
-          min={0}
-          onChange={updateNumber("antiwindup_gain_per_s")}
-        />
-        <NumberInput
-          label="单周期最大校正 (Hz)"
-          value={form.max_step_hz}
-          disabled={isTracking}
-          onChange={updateNumber("max_step_hz", 1)}
-        />
-        <NumberInput
-          label="最大变化率 (Hz/s)"
-          value={form.maximum_slew_hz_per_s}
-          disabled={isTracking}
-          onChange={updateNumber("maximum_slew_hz_per_s", 1)}
-        />
-        <NumberInput
-          label="积分项限幅 (Hz)"
-          value={form.integral_limit_hz}
-          disabled={isTracking}
-          onChange={updateNumber("integral_limit_hz")}
-        />
-        <NumberInput
-          label="失锁偏差阈值 (Hz)"
-          value={form.lock_error_limit_hz}
-          disabled={isTracking}
-          onChange={updateNumber("lock_error_limit_hz", 1)}
-        />
-        <NumberInput
-          label="复数模型最小 R²"
-          value={form.minimum_complex_fit_r2}
-          disabled={isTracking}
-          min={0}
-          max={1}
-          onChange={updateNumber("minimum_complex_fit_r2")}
-        />
-        <NumberInput
-          label="正交残差限值比例"
-          value={form.orthogonal_limit_fraction}
-          disabled={isTracking}
-          min={0.001}
-          onChange={updateNumber("orthogonal_limit_fraction", 0.001)}
-        />
-        <NumberInput
-          label="实时斜率验证间隔 (每峰访问数)"
-          value={form.verify_interval_visits}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              verify_interval_visits: Math.max(
-                1,
-                Math.round(numberOr(value, previous.verify_interval_visits))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="进入可疑的坏样本数"
-          value={form.bad_samples_to_suspect}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              bad_samples_to_suspect: Math.max(
-                1,
-                Math.round(numberOr(value, previous.bad_samples_to_suspect))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="进入重捕获的坏样本数"
-          value={form.bad_samples_to_lose}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              bad_samples_to_lose: Math.max(
-                1,
-                Math.round(numberOr(value, previous.bad_samples_to_lose))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="确认锁定的好样本数"
-          value={form.good_samples_to_lock}
-          disabled={isTracking}
-          min={1}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              good_samples_to_lock: Math.max(
-                1,
-                Math.round(numberOr(value, previous.good_samples_to_lock))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="最大自动重扫次数 (0=不限)"
-          value={form.max_relock_attempts}
-          disabled={isTracking}
-          min={0}
-          onChange={(value) =>
-            setForm((previous) => ({
-              ...previous,
-              max_relock_attempts: Math.max(
-                0,
-                Math.round(numberOr(value, previous.max_relock_attempts))
-              ),
-            }))
-          }
-        />
-        <NumberInput
-          label="最长跟踪时间 (s，0=连续)"
-          value={form.max_tracking_duration_s}
-          disabled={isTracking}
-          onChange={updateNumber("max_tracking_duration_s")}
-        />
+        {showTuning ? (
+          <NumberInput
+            label="独立 DC/峰存在性通道 (-1=未配置)"
+            value={form.independent_dc_channel_index}
+            disabled={isTracking}
+            min={-1}
+            onChange={(value) =>
+              patchForm((previous) => ({
+                ...previous,
+                independent_dc_channel_index: Math.max(
+                  -1,
+                  Math.round(numberOr(value, previous.independent_dc_channel_index))
+                ),
+              }))
+            }
+          />
+        ) : null}
+        {showTuning ? (
+          <NumberInput
+            label="复数模型/斜率探测偏移 (Hz)"
+            value={form.probe_offset_hz}
+            disabled={isTracking}
+            onChange={updateNumber("probe_offset_hz", 1)}
+          />
+        ) : null}
+        {showTuning ? (
+          <NumberInput
+            label="每点稳定等待 (ms)"
+            value={form.tracking_settle_ms}
+            disabled={isTracking}
+            onChange={updateNumber("tracking_settle_ms", 0.1)}
+          />
+        ) : null}
+        {showTuning ? (
+          <NumberInput
+            label="每点平均次数"
+            value={form.sample_averages}
+            disabled={isTracking}
+            min={1}
+            onChange={(value) =>
+              patchForm((previous) => ({
+                ...previous,
+                sample_averages: Math.max(1, Math.round(numberOr(value, previous.sample_averages))),
+              }))
+            }
+          />
+        ) : null}
+        {showExpert ? (
+          <NumberInput
+            label="耗时分析报告间隔 (周期)"
+            value={form.timing_report_interval_cycles}
+            disabled={isTracking}
+            min={1}
+            onChange={(value) =>
+              patchForm((previous) => ({
+                ...previous,
+                timing_report_interval_cycles: Math.max(
+                  1,
+                  Math.round(numberOr(value, previous.timing_report_interval_cycles))
+                ),
+              }))
+            }
+          />
+        ) : null}
       </SimpleGrid>
+
+      {showTuning ? (
+        <>
+          <Text fw={600} mt="md" mb="xs">
+            PID 与锁定门限
+          </Text>
+          <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
+            <NumberInput label="Kp" value={form.kp} disabled={isTracking} onChange={updateNumber("kp")} />
+            <NumberInput
+              label="Ki (1/s)"
+              value={form.ki_per_s}
+              disabled={isTracking}
+              onChange={updateNumber("ki_per_s")}
+            />
+            {showExpert ? (
+              <NumberInput
+                label="Kd (s)"
+                value={form.kd_s}
+                disabled={isTracking}
+                onChange={updateNumber("kd_s")}
+              />
+            ) : null}
+            {showExpert ? (
+              <NumberInput
+                label="微分滤波时间常数 (s)"
+                value={form.derivative_filter_tau_s}
+                disabled={isTracking}
+                min={0}
+                onChange={updateNumber("derivative_filter_tau_s")}
+              />
+            ) : null}
+            {showExpert ? (
+              <NumberInput
+                label="抗饱和反算增益 (1/s)"
+                value={form.antiwindup_gain_per_s}
+                disabled={isTracking}
+                min={0}
+                onChange={updateNumber("antiwindup_gain_per_s")}
+              />
+            ) : null}
+            <NumberInput
+              label="单周期最大校正 (Hz)"
+              value={form.max_step_hz}
+              disabled={isTracking}
+              onChange={updateNumber("max_step_hz", 1)}
+            />
+            {showExpert ? (
+              <NumberInput
+                label="最大变化率 (Hz/s)"
+                value={form.maximum_slew_hz_per_s}
+                disabled={isTracking}
+                onChange={updateNumber("maximum_slew_hz_per_s", 1)}
+              />
+            ) : null}
+            {showExpert ? (
+              <NumberInput
+                label="积分项限幅 (Hz)"
+                value={form.integral_limit_hz}
+                disabled={isTracking}
+                onChange={updateNumber("integral_limit_hz")}
+              />
+            ) : null}
+            <NumberInput
+              label="失锁偏差阈值 (Hz)"
+              value={form.lock_error_limit_hz}
+              disabled={isTracking}
+              onChange={updateNumber("lock_error_limit_hz", 1)}
+            />
+            <NumberInput
+              label="复数模型最小 R²"
+              value={form.minimum_complex_fit_r2}
+              disabled={isTracking}
+              min={0}
+              max={1}
+              onChange={updateNumber("minimum_complex_fit_r2")}
+            />
+            {showExpert ? (
+              <NumberInput
+                label="正交残差限值比例"
+                value={form.orthogonal_limit_fraction}
+                disabled={isTracking}
+                min={0.001}
+                onChange={updateNumber("orthogonal_limit_fraction", 0.001)}
+              />
+            ) : null}
+            {showExpert ? (
+              <NumberInput
+                label="实时斜率验证间隔 (每峰访问数)"
+                value={form.verify_interval_visits}
+                disabled={isTracking}
+                min={1}
+                onChange={(value) =>
+                  patchForm((previous) => ({
+                    ...previous,
+                    verify_interval_visits: Math.max(
+                      1,
+                      Math.round(numberOr(value, previous.verify_interval_visits))
+                    ),
+                  }))
+                }
+              />
+            ) : null}
+            <NumberInput
+              label="进入可疑的坏样本数"
+              value={form.bad_samples_to_suspect}
+              disabled={isTracking}
+              min={1}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  bad_samples_to_suspect: Math.max(
+                    1,
+                    Math.round(numberOr(value, previous.bad_samples_to_suspect))
+                  ),
+                }))
+              }
+            />
+            <NumberInput
+              label="进入重捕获的坏样本数"
+              value={form.bad_samples_to_lose}
+              disabled={isTracking}
+              min={1}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  bad_samples_to_lose: Math.max(
+                    1,
+                    Math.round(numberOr(value, previous.bad_samples_to_lose))
+                  ),
+                }))
+              }
+            />
+            <NumberInput
+              label="确认锁定的好样本数"
+              value={form.good_samples_to_lock}
+              disabled={isTracking}
+              min={1}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  good_samples_to_lock: Math.max(
+                    1,
+                    Math.round(numberOr(value, previous.good_samples_to_lock))
+                  ),
+                }))
+              }
+            />
+            <NumberInput
+              label="最大自动重扫次数 (0=不限)"
+              value={form.max_relock_attempts}
+              disabled={isTracking}
+              min={0}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  max_relock_attempts: Math.max(
+                    0,
+                    Math.round(numberOr(value, previous.max_relock_attempts))
+                  ),
+                }))
+              }
+            />
+            {showExpert ? (
+              <NumberInput
+                label="最长跟踪时间 (s，0=连续)"
+                value={form.max_tracking_duration_s}
+                disabled={isTracking}
+                onChange={updateNumber("max_tracking_duration_s")}
+              />
+            ) : null}
+          </SimpleGrid>
+        </>
+      ) : null}
+
+      {showExpert ? (
+        <Stack gap="sm" mt="md">
+          <Text fw={600}>专家：找峰门槛 / 斜率验证 / 局部重扫</Text>
+          <Text c="dimmed" size="sm">
+            显著度与歧义比只决定「候选是否够格」；峰心始终是双瓣之间的最低谷，不会改成任意极小值。
+          </Text>
+          <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
+            <NumberInput
+              label="峰瓣显著度相对阈值"
+              description="minimum_peak_prominence_fraction"
+              value={form.minimum_peak_prominence_fraction}
+              disabled={isTracking}
+              min={0}
+              max={1}
+              step={0.01}
+              decimalScale={3}
+              onChange={updateNumber("minimum_peak_prominence_fraction")}
+            />
+            <NumberInput
+              label="双峰配对歧义比"
+              description="越接近 1 越严；并列时仍拒绝猜测"
+              value={form.peak_pair_ambiguity_score_ratio}
+              disabled={isTracking}
+              min={0.01}
+              max={1}
+              step={0.01}
+              decimalScale={3}
+              onChange={updateNumber("peak_pair_ambiguity_score_ratio", 0.01)}
+            />
+            <NumberInput
+              label="Δf 物理下限 (Hz)"
+              value={form.delta_f_min_hz}
+              disabled={isTracking}
+              min={0}
+              onChange={updateNumber("delta_f_min_hz")}
+            />
+            <NumberInput
+              label="Δf 物理上限 (Hz)"
+              value={form.delta_f_max_hz}
+              disabled={isTracking}
+              min={1}
+              onChange={updateNumber("delta_f_max_hz", 1)}
+            />
+            <NumberInput
+              label="可分辨间距系数"
+              value={form.minimum_resolvable_separation_factor}
+              disabled={isTracking}
+              min={0}
+              step={0.05}
+              decimalScale={3}
+              onChange={updateNumber("minimum_resolvable_separation_factor")}
+            />
+            <NumberInput
+              label="线性区误差比例"
+              value={form.maximum_error_fraction}
+              disabled={isTracking}
+              min={0.01}
+              max={1}
+              step={0.05}
+              decimalScale={3}
+              onChange={updateNumber("maximum_error_fraction", 0.01)}
+            />
+            <NumberInput
+              label="峰深度比例门限"
+              value={form.minimum_depth_fraction}
+              disabled={isTracking}
+              min={0}
+              max={1}
+              step={0.05}
+              decimalScale={3}
+              onChange={updateNumber("minimum_depth_fraction")}
+            />
+            <NumberInput
+              label="斜率比下限"
+              value={form.slope_ratio_min}
+              disabled={isTracking}
+              min={0.01}
+              step={0.05}
+              decimalScale={3}
+              onChange={updateNumber("slope_ratio_min", 0.01)}
+            />
+            <NumberInput
+              label="斜率比上限"
+              value={form.slope_ratio_max}
+              disabled={isTracking}
+              min={0.1}
+              step={0.1}
+              decimalScale={3}
+              onChange={updateNumber("slope_ratio_max", 0.1)}
+            />
+            <NumberInput
+              label="斜率相位变化上限 (rad)"
+              value={form.maximum_slope_angle_change_rad}
+              disabled={isTracking}
+              min={0.1}
+              step={0.1}
+              decimalScale={3}
+              onChange={updateNumber("maximum_slope_angle_change_rad", 0.1)}
+            />
+            <NumberInput
+              label="斜率验证最大时效 (s)"
+              value={form.slope_verification_max_age_s}
+              disabled={isTracking}
+              min={0.1}
+              onChange={updateNumber("slope_verification_max_age_s", 0.1)}
+            />
+            <NumberInput
+              label="局部重扫点数"
+              value={form.local_scan_points}
+              disabled={isTracking}
+              min={7}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  local_scan_points: Math.max(7, Math.round(numberOr(value, previous.local_scan_points))),
+                }))
+              }
+            />
+            <NumberInput
+              label="局部初宽 / FWHM"
+              value={form.local_scan_initial_width_fraction}
+              disabled={isTracking}
+              min={0.1}
+              step={0.1}
+              decimalScale={3}
+              onChange={updateNumber("local_scan_initial_width_fraction", 0.1)}
+            />
+            <NumberInput
+              label="局部扩窗倍数"
+              value={form.local_scan_expansion_factor}
+              disabled={isTracking}
+              min={1.01}
+              step={0.1}
+              decimalScale={3}
+              onChange={updateNumber("local_scan_expansion_factor", 1.01)}
+            />
+            <NumberInput
+              label="局部最大扩窗次数"
+              value={form.local_scan_max_expansions}
+              disabled={isTracking}
+              min={1}
+              onChange={(value) =>
+                patchForm((previous) => ({
+                  ...previous,
+                  local_scan_max_expansions: Math.max(
+                    1,
+                    Math.round(numberOr(value, previous.local_scan_max_expansions))
+                  ),
+                }))
+              }
+            />
+            <NumberInput
+              label="身份保护带 / FWHM"
+              value={form.reacquire_identity_guard_fraction}
+              disabled={isTracking}
+              min={0}
+              step={0.05}
+              decimalScale={3}
+              onChange={updateNumber("reacquire_identity_guard_fraction")}
+            />
+          </SimpleGrid>
+        </Stack>
+      ) : null}
 
       <Group mt="md">
         <Button
           variant="light"
           color="gray"
-          onClick={onSyncFromOdmr}
+          onClick={() => {
+            markConfigDirty();
+            onSyncFromMicrowave?.();
+          }}
           disabled={isTracking}
         >
-          继承 ODMR 扫频范围
+          从微波页同步
         </Button>
         <Button
           variant="light"
           color="gray"
-          onClick={onUseDefaultResonance}
+          onClick={() => {
+            markConfigDirty();
+            onUseDefaultResonance?.();
+          }}
           disabled={isTracking}
         >
           回到 2.87 GHz 默认范围
         </Button>
+        <Button
+          color="cyan"
+          variant={configConfirmed ? "light" : "filled"}
+          onClick={confirmCurrentConfig}
+          disabled={isTracking}
+        >
+          确认配置
+        </Button>
+        <Badge variant="light" color={configConfirmed ? "teal" : "yellow"}>
+          {configConfirmed ? "配置已确认" : "配置未确认"}
+        </Badge>
+        <Badge variant="light" color="gray">
+          {UI_MODES[uiMode]?.label || uiMode}
+        </Badge>
         <Text c="dimmed" size="sm">
-          局部重扫会自动扩大，但不会超过这里设置的起止频率。
+          局部重扫会自动扩大，但不会超过这里设置的起止频率。启动跟踪前请先确认配置。
         </Text>
       </Group>
 
@@ -871,7 +1495,7 @@ export function CurrentTrackingPanel({
           checked={form.record_enabled}
           disabled={isTracking}
           onChange={(event) =>
-            setForm((previous) => ({
+            patchForm((previous) => ({
               ...previous,
               record_enabled: event.currentTarget.checked,
             }))
@@ -895,7 +1519,7 @@ export function CurrentTrackingPanel({
           maxLength={80}
           placeholder="例如 coil_2A_13h"
           onChange={(event) =>
-            setForm((previous) => ({
+            patchForm((previous) => ({
               ...previous,
               record_label: event.currentTarget.value,
             }))
@@ -908,7 +1532,7 @@ export function CurrentTrackingPanel({
           color="cyan"
           onClick={startTracking}
           loading={lockState === "connecting" || lockState === "acquiring"}
-          disabled={measurementBusy || isTracking}
+          disabled={measurementBusy || isTracking || !configConfirmed}
         >
           启动 PID 双峰跟踪
         </Button>
@@ -954,29 +1578,24 @@ export function CurrentTrackingPanel({
         </Button>
       </Group>
 
-      <SimpleGrid cols={{ base: 1, md: 2, xl: 6 }} mt="lg">
+      <Text fw={600} mt="lg" mb="xs">
+        实时输出
+        <Text span c="dimmed" size="sm" ml="sm" fw={400}>
+          {uiMode === "simple"
+            ? "简易：锁定状态 · 电流 · Δf · 峰位"
+            : uiMode === "tuning"
+              ? "调机：结果 + 下发频率 / PID 摘要"
+              : "专家：结果 + PID + 时间瓶颈"}
+        </Text>
+      </Text>
+      <SimpleGrid cols={{ base: 1, md: 2, xl: uiMode === "simple" ? 5 : 6 }} mt="xs">
         <MetricCard
-          label="实际目标"
-          value={targetLabel(latestPoint?.tracking_target || activeTarget)}
-          hint={`${latestPoint?.left_state || "--"} / ${latestPoint?.right_state || "--"}`}
-        />
-        <MetricCard
-          label="左峰 fL"
-          value={Number.isFinite(Number(latestPoint?.left_frequency_hz)) ? formatGHz(latestPoint.left_frequency_hz) : "--"}
-          hint={`误差 ${formatKHz(latestPoint?.left_error_hz)}`}
-        />
-        <MetricCard
-          label="右峰 fR"
-          value={Number.isFinite(Number(latestPoint?.right_frequency_hz)) ? formatGHz(latestPoint.right_frequency_hz) : "--"}
-          hint={`误差 ${formatKHz(latestPoint?.right_error_hz)}`}
-        />
-        <MetricCard
-          label="实时劈裂 Δf"
-          value={formatMHz(latestPoint?.splitting_hz)}
+          label="锁定状态"
+          value={`${peakStateLabel(latestPoint?.left_state)} / ${peakStateLabel(latestPoint?.right_state)}`}
           hint={
-            Number.isFinite(Number(latestPoint?.delta_f_sigma_hz))
-              ? `σ ${formatKHz(latestPoint.delta_f_sigma_hz)}`
-              : "fR - fL"
+            latestPoint?.valid
+              ? "双峰 LOCKED，输出有效"
+              : invalidReasonLabel(latestPoint?.invalid_reason)
           }
         />
         <MetricCard
@@ -986,105 +1605,168 @@ export function CurrentTrackingPanel({
             latestPoint?.valid
               ? saturated
                 ? "有效；PID 输出已限幅"
-                : "有效输出"
-              : `无效：${latestPoint?.invalid_reason || "等待锁定"}`
+                : "I = a·Δf + b（标定）"
+              : `无效：${invalidReasonLabel(latestPoint?.invalid_reason)}`
           }
         />
         <MetricCard
-          label="更新速率"
-          value={
-            Number.isFinite(latestUpdateRateHz)
-              ? `${latestUpdateRateHz.toFixed(2)} Hz`
-              : "--"
-          }
-          hint={`自动重扫 ${relockCount} 次`}
-        />
-      </SimpleGrid>
-
-      <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} mt="md">
-        <MetricCard
-          label="左下发频率"
-          value={Number.isFinite(Number(leftPid.applied_hz)) ? formatGHz(leftPid.applied_hz) : "--"}
-          hint={`P ${formatKHz(leftPid.p_hz)} / I ${formatKHz(leftPid.i_hz)} / D ${formatKHz(leftPid.d_hz)}`}
-        />
-        <MetricCard
-          label="右下发频率"
-          value={Number.isFinite(Number(rightPid.applied_hz)) ? formatGHz(rightPid.applied_hz) : "--"}
-          hint={`P ${formatKHz(rightPid.p_hz)} / I ${formatKHz(rightPid.i_hz)} / D ${formatKHz(rightPid.d_hz)}`}
-        />
-        <MetricCard
-          label="左积分状态"
-          value={formatKHz(leftPid.i_hz)}
-          hint={leftPid.saturated ? "混合抗饱和生效" : `q ${formatKHz(latestPoint?.left_q_hz)}`}
-        />
-        <MetricCard
-          label="右积分状态"
-          value={formatKHz(rightPid.i_hz)}
-          hint={rightPid.saturated ? "混合抗饱和生效" : `q ${formatKHz(latestPoint?.right_q_hz)}`}
-        />
-      </SimpleGrid>
-
-      <Text fw={600} mt="lg">跟踪时间瓶颈分析</Text>
-      <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} mt="xs">
-        <MetricCard
-          label="自动判定瓶颈"
-          value={timingBottleneckLabel(timingDiagnostics?.bottleneck)}
+          label="实时劈裂 Δf"
+          value={formatMHz(latestPoint?.splitting_hz)}
           hint={
-            Number.isFinite(Number(timingDiagnostics?.stage_share?.[timingDiagnostics?.bottleneck]))
-              ? `占采集时间 ${(Number(timingDiagnostics.stage_share[timingDiagnostics.bottleneck]) * 100).toFixed(1)}%`
-              : "累计首个闭环周期后开始分析"
+            Number.isFinite(Number(latestPoint?.delta_f_sigma_hz))
+              ? `fR−fL · σ ${formatKHz(latestPoint.delta_f_sigma_hz)}`
+              : "fR − fL"
           }
         />
         <MetricCard
-          label="实测双峰更新率"
-          value={
-            Number.isFinite(Number(timingDiagnostics?.measured_update_rate_hz))
-              ? `${Number(timingDiagnostics.measured_update_rate_hz).toFixed(2)} Hz`
-              : "--"
-          }
-          hint={`周期 P50 ${formatMs(timingDiagnostics?.cycle_median_ms)} / P95 ${formatMs(timingDiagnostics?.cycle_p95_ms)}`}
+          label="左峰 fL"
+          value={Number.isFinite(Number(latestPoint?.left_frequency_hz)) ? formatGHz(latestPoint.left_frequency_hz) : "--"}
+          hint={`鉴频误差 ${formatKHz(latestPoint?.left_error_hz)}`}
         />
         <MetricCard
-          label="微波 SCPI 写频"
-          value={formatMs(timingDiagnostics?.stage_mean_ms?.microwave_command_ms)}
-          hint="每个频点的 VISA resource.write 耗时"
+          label="右峰 fR"
+          value={Number.isFinite(Number(latestPoint?.right_frequency_hz)) ? formatGHz(latestPoint.right_frequency_hz) : "--"}
+          hint={`鉴频误差 ${formatKHz(latestPoint?.right_error_hz)}`}
         />
-        <MetricCard
-          label="显式稳定等待"
-          value={formatMs(timingDiagnostics?.stage_mean_ms?.settle_ms)}
-          hint={`配置 ${formatMs(timingDiagnostics?.configured_tracking_settle_ms)} / 实际下限 ${formatMs(timingDiagnostics?.effective_settle_ms)}`}
-        />
-        <MetricCard
-          label="Zurich 设备锁等待"
-          value={formatMs(timingDiagnostics?.stage_mean_ms?.lock_wait_ms)}
-          hint={
-            timingDiagnostics?.background_sampler_running
-              ? `后台 poll 开启，记录窗 ${formatMs(timingDiagnostics?.background_poll_recording_ms)}`
-              : "后台 poll 未运行"
-          }
-        />
-        <MetricCard
-          label="Zurich 单点读取"
-          value={formatMs(timingDiagnostics?.stage_mean_ms?.lockin_read_ms)}
-          hint="demod.sample() 调用耗时"
-        />
-        <MetricCard
-          label="单频点采集"
-          value={formatMs(timingDiagnostics?.acquisition_median_ms)}
-          hint={`P95 ${formatMs(timingDiagnostics?.acquisition_p95_ms)}`}
-        />
-        <MetricCard
-          label="实际锁相配置"
-          value={
-            Number.isFinite(Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz))
-              ? `${Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz).toFixed(2)} Hz`
-              : "--"
-          }
-          hint={`Demod ${timingDiagnostics?.demod_index ?? "--"} / τ ${formatMs(timingDiagnostics?.device_time_constant_ms ?? timingDiagnostics?.lockin_time_constant_ms)} / ${timingDiagnostics?.device_filter_order ?? timingDiagnostics?.lockin_filter_order ?? "--"} 阶${timingDiagnostics?.filter_cache_mismatch ? "；后端缓存不一致" : ""}`}
-        />
+        {showTuning ? (
+          <MetricCard
+            label="更新速率"
+            value={
+              Number.isFinite(latestUpdateRateHz)
+                ? `${latestUpdateRateHz.toFixed(2)} Hz`
+                : "--"
+            }
+            hint={`自动重扫 ${relockCount} 次`}
+          />
+        ) : null}
+        {showExpert ? (
+          <MetricCard
+            label="实际目标"
+            value={targetLabel(latestPoint?.tracking_target || activeTarget)}
+            hint="跟踪算法目标（现为复数投影）"
+          />
+        ) : null}
       </SimpleGrid>
 
-      <Grid mt="lg">
+      {showTuning ? (
+        <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} mt="md">
+          <MetricCard
+            label="左下发频率"
+            value={Number.isFinite(Number(leftPid.applied_hz)) ? formatGHz(leftPid.applied_hz) : "--"}
+            hint={
+              showExpert
+                ? `P ${formatKHz(leftPid.p_hz)} / I ${formatKHz(leftPid.i_hz)} / D ${formatKHz(leftPid.d_hz)}`
+                : `命令微波 · I ${formatKHz(leftPid.i_hz)}${leftPid.saturated ? " · 限幅" : ""}`
+            }
+          />
+          <MetricCard
+            label="右下发频率"
+            value={Number.isFinite(Number(rightPid.applied_hz)) ? formatGHz(rightPid.applied_hz) : "--"}
+            hint={
+              showExpert
+                ? `P ${formatKHz(rightPid.p_hz)} / I ${formatKHz(rightPid.i_hz)} / D ${formatKHz(rightPid.d_hz)}`
+                : `命令微波 · I ${formatKHz(rightPid.i_hz)}${rightPid.saturated ? " · 限幅" : ""}`
+            }
+          />
+          {showExpert ? (
+            <MetricCard
+              label="左积分 / 正交"
+              value={formatKHz(leftPid.i_hz)}
+              hint={leftPid.saturated ? "混合抗饱和生效" : `q ${formatKHz(latestPoint?.left_q_hz)}`}
+            />
+          ) : null}
+          {showExpert ? (
+            <MetricCard
+              label="右积分 / 正交"
+              value={formatKHz(rightPid.i_hz)}
+              hint={rightPid.saturated ? "混合抗饱和生效" : `q ${formatKHz(latestPoint?.right_q_hz)}`}
+            />
+          ) : null}
+        </SimpleGrid>
+      ) : null}
+
+      {showExpert ? (
+        <>
+          <Text fw={600} mt="lg">
+            跟踪时间瓶颈分析
+          </Text>
+          <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} mt="xs">
+            <MetricCard
+              label="自动判定瓶颈"
+              value={timingBottleneckLabel(timingDiagnostics?.bottleneck)}
+              hint={
+                Number.isFinite(Number(timingDiagnostics?.stage_share?.[timingDiagnostics?.bottleneck]))
+                  ? `占采集时间 ${(Number(timingDiagnostics.stage_share[timingDiagnostics.bottleneck]) * 100).toFixed(1)}%`
+                  : "累计首个闭环周期后开始分析"
+              }
+            />
+            <MetricCard
+              label="实测双峰更新率"
+              value={
+                Number.isFinite(Number(timingDiagnostics?.measured_update_rate_hz))
+                  ? `${Number(timingDiagnostics.measured_update_rate_hz).toFixed(2)} Hz`
+                  : "--"
+              }
+              hint={`周期 P50 ${formatMs(timingDiagnostics?.cycle_median_ms)} / P95 ${formatMs(timingDiagnostics?.cycle_p95_ms)}`}
+            />
+            <MetricCard
+              label="微波 SCPI 写频"
+              value={formatMs(timingDiagnostics?.stage_mean_ms?.microwave_command_ms)}
+              hint="每个频点的 VISA resource.write 耗时"
+            />
+            <MetricCard
+              label="显式稳定等待"
+              value={formatMs(timingDiagnostics?.stage_mean_ms?.settle_ms)}
+              hint={`配置 ${formatMs(timingDiagnostics?.configured_tracking_settle_ms)} / 实际下限 ${formatMs(timingDiagnostics?.effective_settle_ms)}`}
+            />
+            <MetricCard
+              label="Zurich 设备锁等待"
+              value={formatMs(timingDiagnostics?.stage_mean_ms?.lock_wait_ms)}
+              hint={
+                timingDiagnostics?.background_sampler_running
+                  ? `后台 poll 开启，记录窗 ${formatMs(timingDiagnostics?.background_poll_recording_ms)}`
+                  : "后台 poll 未运行"
+              }
+            />
+            <MetricCard
+              label="Zurich 单点读取"
+              value={formatMs(timingDiagnostics?.stage_mean_ms?.lockin_read_ms)}
+              hint="demod.sample() 调用耗时"
+            />
+            <MetricCard
+              label="单频点采集"
+              value={formatMs(timingDiagnostics?.acquisition_median_ms)}
+              hint={`P95 ${formatMs(timingDiagnostics?.acquisition_p95_ms)}`}
+            />
+            <MetricCard
+              label="实际锁相配置"
+              value={
+                Number.isFinite(Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz))
+                  ? `${Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz).toFixed(2)} Hz`
+                  : "--"
+              }
+              hint={`Demod ${timingDiagnostics?.demod_index ?? "--"} / τ ${formatMs(timingDiagnostics?.device_time_constant_ms ?? timingDiagnostics?.lockin_time_constant_ms)} / ${timingDiagnostics?.device_filter_order ?? timingDiagnostics?.lockin_filter_order ?? "--"} 阶${timingDiagnostics?.filter_cache_mismatch ? "；后端缓存不一致" : ""}`}
+            />
+          </SimpleGrid>
+        </>
+      ) : null}
+
+      <Group mt="lg" justify="space-between" align="end">
+        <Text fw={600}>实时曲线</Text>
+        <Select
+          label="显示窗口"
+          description="频率与电流图共用；内存最多保留最近 1 h"
+          value={String(plotWindowS)}
+          data={PLOT_WINDOW_OPTIONS.map((item) => ({
+            value: item.value,
+            label: item.label,
+          }))}
+          onChange={changePlotWindow}
+          w={160}
+          allowDeselect={false}
+        />
+      </Group>
+      <Grid mt="sm">
         <Grid.Col span={{ base: 12, xl: 7 }}>
           <Stack gap="xs">
             <Text fw={600}>左右共振频率</Text>
@@ -1107,7 +1789,8 @@ export function CurrentTrackingPanel({
               ]}
               xTitle="Elapsed Time (s)"
               yTitle="Frequency (GHz)"
-              uirevision="current-pid-frequency"
+              xRange={plotXRange}
+              uirevision={`current-pid-frequency-${plotWindowS}`}
             />
           </Stack>
         </Grid.Col>
@@ -1126,7 +1809,8 @@ export function CurrentTrackingPanel({
               ]}
               xTitle="Elapsed Time (s)"
               yTitle="Current (mA)"
-              uirevision="current-pid-current"
+              xRange={plotXRange}
+              uirevision={`current-pid-current-${plotWindowS}`}
             />
           </Stack>
         </Grid.Col>
