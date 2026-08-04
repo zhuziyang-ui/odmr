@@ -8,6 +8,8 @@
 
 > 硬件仪器（Zurich Instruments 锁相、Keysight 微波源等）**不是**跑通软件的必要条件。无仪器时可用模拟/离线模式开发与自检；接真机时再安装厂商驱动与 VISA。
 
+> **电脑完全不能上网？** 请改看 **[OFFLINE_SETUP.md](./OFFLINE_SETUP.md)**（U 盘打包 / 离线 pip·npm 安装）。
+
 ---
 
 ## 0. 需要安装什么（总览）
@@ -303,8 +305,9 @@ npm.cmd install
 
 | 文档 | 内容 |
 | --- | --- |
+| [OFFLINE_SETUP.md](./OFFLINE_SETUP.md) | **无外网**时用 U 盘打包/安装 |
 | [STARTUP.md](./STARTUP.md) | 已有环境时的启停与更新 |
 | [README.md](./README.md) | 功能说明、PID / EKF·UKF 调参 |
-| `scripts/` | 分服务启动脚本 |
+| `scripts/` | 分服务启动与离线打包脚本 |
 
 配置完成后，日常只需：**`git pull` → 更新依赖（有变化时）→ `start.bat`**。
