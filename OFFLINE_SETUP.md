@@ -326,6 +326,7 @@ npm.cmd rebuild esbuild
 
 | 文档 | 内容 |
 | --- | --- |
+| [PORTABLE.md](./PORTABLE.md) | **免安装**便携夹（对方双击即用，推荐给最终用户） |
 | [ENV_SETUP.md](./ENV_SETUP.md) | 有网时的从零安装 |
 | [STARTUP.md](./STARTUP.md) | 日常启停 |
 | `scripts\pack-offline-bundle.bat` | 联网机打包 |

@@ -2,7 +2,8 @@
 
 - **仓库**：https://github.com/zhuziyang-ui/odmr  
 - **全新空白电脑（有网）**：请先完整阅读 [ENV_SETUP.md](./ENV_SETUP.md)（从安装 Git / Python / Node 到首次启动）。  
-- **无外网 / 实验室隔离网**：请看 [OFFLINE_SETUP.md](./OFFLINE_SETUP.md)（U 盘离线包）。
+- **无外网 / 实验室隔离网**：请看 [OFFLINE_SETUP.md](./OFFLINE_SETUP.md)（U 盘离线包）。  
+- **免安装双击即用（推荐给别人）**：[PORTABLE.md](./PORTABLE.md) → `scripts\build-portable.bat`。
 
 本文件面向 **已装好环境** 的日常启停与更新。
 
