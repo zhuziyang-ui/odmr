@@ -581,12 +581,18 @@ def find_fm_magnitude_resonances(
     complex_values: Any,
     *,
     minimum_prominence_fraction: float,
+    lobe_maximum_height_fraction: float = 0.15,
 ) -> list[FmResonanceCandidate]:
     """Find ``lobe - valley - lobe`` resonances in a 1f FM magnitude scan.
 
     The complex samples are retained because the apparent valley between two
     different resonances can also be bracketed by R lobes.  Its complex slope is
     reversed, which lets pair selection reject that false center.
+
+    ``lobe_maximum_height_fraction`` drops noise-floor local maxima that sit in a
+    valley bottom.  Without this, a tiny mid-valley bump splits a real dual-lobe
+    resonance into two weak pairs and ``no_two_lobes`` fires even when both
+    peaks are clearly present (common after current changes / denser sampling).
     """
     if np is None:
         raise RuntimeError("numpy 不可用，无法识别 FM 解调共振。")
@@ -608,6 +614,8 @@ def find_fm_magnitude_resonances(
         raise ValueError("FM 扫频频率必须严格递增。")
     if not 0.0 <= minimum_prominence_fraction <= 1.0:
         raise ValueError("FM 峰瓣显著度比例必须位于 [0, 1]。")
+    if not 0.0 <= float(lobe_maximum_height_fraction) <= 1.0:
+        raise ValueError("FM 峰瓣高度过滤比例必须位于 [0, 1]。")
 
     smoothed = np.convolve(r_array, np.asarray([0.25, 0.5, 0.25]), mode="same")
     smoothed[0] = r_array[0]
@@ -622,6 +630,19 @@ def find_fm_magnitude_resonances(
             or smoothed[index] > smoothed[index + 1]
         )
     ]
+    # Drop noise-floor "maxima" inside valleys (they break consecutive lobe pairs).
+    if maxima:
+        peak_level = float(np.max(smoothed))
+        floor_level = float(np.percentile(smoothed, 20))
+        height_span = max(peak_level - floor_level, 0.0)
+        height_threshold = floor_level + float(lobe_maximum_height_fraction) * height_span
+        if height_span > 0.0 and math.isfinite(height_threshold):
+            strong_maxima = [
+                index for index in maxima if smoothed[index] >= height_threshold
+            ]
+            # Keep the filter only when it still leaves at least two lobes to pair.
+            if len(strong_maxima) >= 2:
+                maxima = strong_maxima
     raw_candidates: list[FmResonanceCandidate] = []
     for left_index, right_index in zip(maxima, maxima[1:]):
         if right_index - left_index < 2:

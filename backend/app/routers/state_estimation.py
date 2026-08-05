@@ -68,16 +68,20 @@ async def state_estimation_current_ws(websocket: WebSocket) -> None:
 
         result = await worker
         runtime.finish(request, result)
-        await websocket.send_json(
-            {
-                "type": (
-                    "state_estimation_cancelled"
-                    if result.get("status") == "cancelled"
-                    else "state_estimation_complete"
-                ),
-                "result": result,
-            }
-        )
+        status = str(result.get("status", "completed"))
+        if status == "cancelled":
+            event_type = "state_estimation_cancelled"
+        elif status == "error":
+            event_type = "state_estimation_error"
+        else:
+            event_type = "state_estimation_complete"
+        payload: dict = {"type": event_type, "result": result}
+        if status == "error":
+            payload["message"] = str(
+                result.get("stop_reason")
+                or "状态估计异常结束。"
+            )
+        await websocket.send_json(payload)
     except WebSocketDisconnect:
         if worker is not None:
             manager.cancel_odmr_stream()

@@ -172,7 +172,8 @@ class CurrentScanRequest(BaseModel):
     channel_index: int = Field(default=0, ge=0)
     start_hz: float = Field(default=2.83e9)
     stop_hz: float = Field(default=2.91e9)
-    search_points: int = Field(default=121, ge=11, le=4001)
+    # Align with linear-sweep helper / frontend MAX (10 kHz over ~80 MHz → 8001 pts).
+    search_points: int = Field(default=121, ge=11, le=MAX_LINEAR_SWEEP_POINTS)
     settle_ms: float = Field(default=30.0, ge=1.0)
     slope_fit_points: int = Field(default=9, ge=3, le=41)
     phase_target: Literal["x_v", "y_v", "auto"] = "auto"
@@ -184,7 +185,8 @@ class CurrentTrackingRequest(BaseModel):
     tracking_target: Literal["complex_projection"] = "complex_projection"
     start_hz: float = Field(default=2.83e9)
     stop_hz: float = Field(default=2.91e9)
-    search_points: int = Field(default=121, ge=11, le=4001)
+    # Full-scan search density: same cap as state-estimation / frontend linear sweep.
+    search_points: int = Field(default=121, ge=11, le=MAX_LINEAR_SWEEP_POINTS)
     # Defaults = 稳健 preset: looser noise thresholds, same lobe–valley–lobe peak definition.
     search_settle_ms: float = Field(default=15.0, ge=0.1, le=5000.0)
     probe_offset_hz: float = Field(default=250_000.0, gt=0.0)

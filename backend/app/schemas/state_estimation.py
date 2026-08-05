@@ -26,7 +26,8 @@ class StateEstimationTrackingRequest(BaseModel):
     search_step_hz: float = Field(default=DEFAULT_FREQ_STEP_HZ, gt=0.0)
     search_points: int = Field(default=42001, ge=11, le=MAX_LINEAR_SWEEP_POINTS)
     search_settle_ms: float = Field(default=10.0, ge=0.1, le=5000.0)
-    tracking_settle_ms: float = Field(default=3.0, ge=0.1, le=5000.0)
+    # Longer settle → lower measurement noise → frequency more observable.
+    tracking_settle_ms: float = Field(default=8.0, ge=0.1, le=5000.0)
     sample_averages: int = Field(default=1, ge=1, le=100)
     probe_offset_hz: float = Field(default=250_000.0, gt=0.0)
     calibration_points_each_side: int = Field(default=2, ge=1, le=10)
@@ -45,18 +46,23 @@ class StateEstimationTrackingRequest(BaseModel):
         description="X/Y 单轴测量噪声；0 表示根据初始复数拟合残差自动估计。",
     )
     initial_frequency_sigma_hz: float = Field(default=250_000.0, gt=0.0)
-    initial_velocity_sigma_hz_per_s: float = Field(default=2.0e6, gt=0.0)
-    acceleration_noise_hz_per_s2: float = Field(default=5.0e6, gt=0.0)
-    baseline_process_noise_v_per_sqrt_s: float = Field(default=2.0e-5, ge=0.0)
-    slope_relative_process_noise_per_sqrt_s: float = Field(default=0.02, ge=0.0)
+    initial_velocity_sigma_hz_per_s: float = Field(default=500_000.0, gt=0.0)
+    # Quasi-static current: reduced CWNA + explicit frequency random walk.
+    acceleration_noise_hz_per_s2: float = Field(default=300_000.0, gt=0.0)
+    frequency_random_walk_hz_per_sqrt_s: float = Field(default=80_000.0, ge=0.0)
+    velocity_damping_per_s: float = Field(default=0.5, ge=0.0, le=20.0)
+    baseline_process_noise_v_per_sqrt_s: float = Field(default=1.0e-5, ge=0.0)
+    slope_relative_process_noise_per_sqrt_s: float = Field(default=0.01, ge=0.0)
     calibration_residual_sigma_a: float = Field(default=0.0, ge=0.0)
 
     innovation_gate_sigma: float = Field(default=4.0, ge=1.0, le=20.0)
     bad_updates_to_reacquire: int = Field(default=4, ge=1, le=1000)
-    maximum_frequency_sigma_hz: float = Field(default=1.5e6, gt=0.0)
-    maximum_delta_f_sigma_hz: float = Field(default=2.0e6, gt=0.0)
-    maximum_prediction_age_s: float = Field(default=1.0, gt=0.0, le=60.0)
-    max_reacquire_attempts: int = Field(default=5, ge=0, le=1000)
+    # Require several consecutive bad cycles before full re-scan (hysteresis).
+    uncertainty_cycles_to_reacquire: int = Field(default=12, ge=1, le=1000)
+    maximum_frequency_sigma_hz: float = Field(default=2.5e6, gt=0.0)
+    maximum_delta_f_sigma_hz: float = Field(default=3.0e6, gt=0.0)
+    maximum_prediction_age_s: float = Field(default=1.5, gt=0.0, le=60.0)
+    max_reacquire_attempts: int = Field(default=8, ge=0, le=1000)
     max_tracking_duration_s: float = Field(default=0.0, ge=0.0, le=604800.0)
 
     calibration_slope_a_per_hz: float | None = None
