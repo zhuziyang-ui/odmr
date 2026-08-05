@@ -99,6 +99,8 @@ class JointPeakStateEstimator:
         calibration_slope_a_per_hz: float | None,
         calibration_intercept_a: float | None,
         calibration_residual_sigma_a: float = 0.0,
+        frequency_random_walk_hz_per_sqrt_s: float = 80_000.0,
+        velocity_damping_per_s: float = 0.5,
     ) -> None:
         if estimator_type not in {"ekf", "ukf"}:
             raise ValueError("estimator_type 必须为 ekf 或 ukf。")
@@ -111,7 +113,15 @@ class JointPeakStateEstimator:
         self.slope_relative_process_noise_per_sqrt_s = float(
             slope_relative_process_noise_per_sqrt_s
         )
+        self.frequency_random_walk_hz_per_sqrt_s = max(
+            float(frequency_random_walk_hz_per_sqrt_s),
+            0.0,
+        )
+        self.velocity_damping_per_s = max(float(velocity_damping_per_s), 0.0)
         self.innovation_gate_sigma = float(innovation_gate_sigma)
+        # Adaptive process-noise scale: shrinks when updates look consistent.
+        self._process_noise_scale = 1.0
+        self._recent_nis: list[float] = []
         self.calibration_slope_a_per_hz = (
             None
             if calibration_slope_a_per_hz is None
@@ -255,34 +265,72 @@ class JointPeakStateEstimator:
         stable = (eigenvectors * clipped) @ eigenvectors.T
         return 0.5 * ((stable * scale_outer) + (stable * scale_outer).T)
 
+    def _velocity_damping_factor(self, dt_s: float) -> float:
+        """Mean-revert peak velocity toward 0 (quasi-static current)."""
+        if self.velocity_damping_per_s <= 0.0:
+            return 1.0
+        return float(math.exp(-self.velocity_damping_per_s * max(dt_s, 0.0)))
+
     def _transition(self, state: np.ndarray, dt_s: float) -> np.ndarray:
         predicted = np.asarray(state, dtype=float).copy()
-        predicted[self.F_LEFT] += predicted[self.V_LEFT] * dt_s
-        predicted[self.F_RIGHT] += predicted[self.V_RIGHT] * dt_s
+        damp = self._velocity_damping_factor(dt_s)
+        # Integrate damped velocity: Δf = v * (1-e^{-βΔt})/β ≈ v·dt for small βΔt.
+        if self.velocity_damping_per_s > 1e-12:
+            integral = (1.0 - damp) / self.velocity_damping_per_s
+        else:
+            integral = dt_s
+        predicted[self.F_LEFT] += predicted[self.V_LEFT] * integral
+        predicted[self.F_RIGHT] += predicted[self.V_RIGHT] * integral
+        predicted[self.V_LEFT] *= damp
+        predicted[self.V_RIGHT] *= damp
         current = self._current_from_frequencies(predicted)
         predicted[self.CURRENT] = 0.0 if current is None else current
         return predicted
 
     def _transition_jacobian(self, dt_s: float) -> np.ndarray:
         jacobian = np.eye(self.DIMENSION, dtype=float)
-        jacobian[self.F_LEFT, self.V_LEFT] = dt_s
-        jacobian[self.F_RIGHT, self.V_RIGHT] = dt_s
+        damp = self._velocity_damping_factor(dt_s)
+        if self.velocity_damping_per_s > 1e-12:
+            integral = (1.0 - damp) / self.velocity_damping_per_s
+        else:
+            integral = dt_s
+        jacobian[self.F_LEFT, self.V_LEFT] = integral
+        jacobian[self.F_RIGHT, self.V_RIGHT] = integral
+        jacobian[self.V_LEFT, self.V_LEFT] = damp
+        jacobian[self.V_RIGHT, self.V_RIGHT] = damp
         if self.current_calibrated:
             slope = float(self.calibration_slope_a_per_hz)
             jacobian[self.CURRENT, :] = 0.0
             jacobian[self.CURRENT, self.F_LEFT] = -slope
             jacobian[self.CURRENT, self.F_RIGHT] = slope
-            jacobian[self.CURRENT, self.V_LEFT] = -slope * dt_s
-            jacobian[self.CURRENT, self.V_RIGHT] = slope * dt_s
+            jacobian[self.CURRENT, self.V_LEFT] = -slope * integral
+            jacobian[self.CURRENT, self.V_RIGHT] = slope * integral
         return jacobian
 
     def _process_covariance(self, dt_s: float) -> np.ndarray:
+        """Quasi-static-friendly process noise.
+
+        Previous pure CWNA with large acceleration noise made σ_f grow within
+        seconds after a full scan, driving confidence down and false reacquiries.
+        Now: modest frequency random walk + reduced CWNA, scaled adaptively.
+        """
         dt_s = max(float(dt_s), 1e-9)
         q = np.zeros_like(self.P)
-        acceleration_variance = self.acceleration_noise_hz_per_s2**2
-        position_variance = 0.25 * dt_s**4 * acceleration_variance
+        scale = max(float(self._process_noise_scale), 0.05)
+        acceleration_variance = (self.acceleration_noise_hz_per_s2**2) * scale
+        frequency_walk = (
+            self.frequency_random_walk_hz_per_sqrt_s**2 * dt_s * scale
+        )
+        position_variance = 0.25 * dt_s**4 * acceleration_variance + frequency_walk
         position_velocity_covariance = 0.5 * dt_s**3 * acceleration_variance
+        # Damped velocity diffusion stays bounded.
         velocity_variance = dt_s**2 * acceleration_variance
+        if self.velocity_damping_per_s > 1e-12:
+            # Stationary OU velocity variance contribution ~ σ_a²/(2β) * (1-e^{-2βdt})
+            beta = self.velocity_damping_per_s
+            velocity_variance = (
+                acceleration_variance / (2.0 * beta) * (1.0 - math.exp(-2.0 * beta * dt_s))
+            )
         for frequency_index, velocity_index in (
             (self.F_LEFT, self.V_LEFT),
             (self.F_RIGHT, self.V_RIGHT),
@@ -291,7 +339,9 @@ class JointPeakStateEstimator:
             q[frequency_index, velocity_index] = position_velocity_covariance
             q[velocity_index, frequency_index] = position_velocity_covariance
             q[velocity_index, velocity_index] = velocity_variance
-        baseline_variance = self.baseline_process_noise_v_per_sqrt_s**2 * dt_s
+        baseline_variance = (
+            self.baseline_process_noise_v_per_sqrt_s**2 * dt_s * scale
+        )
         for index in (
             self.B_LEFT_RE,
             self.B_LEFT_IM,
@@ -307,7 +357,7 @@ class JointPeakStateEstimator:
                 1e-15,
             )
         )
-        slope_variance = slope_sigma**2 * dt_s
+        slope_variance = slope_sigma**2 * dt_s * scale
         for index in (
             self.G_LEFT_RE,
             self.G_LEFT_IM,
@@ -316,6 +366,24 @@ class JointPeakStateEstimator:
         ):
             q[index, index] = slope_variance
         return q
+
+    def _update_process_noise_scale(self, *, accepted: bool, nis: float) -> None:
+        """Shrink Q when innovations are consistent; expand if rejected/large NIS."""
+        if math.isfinite(nis):
+            self._recent_nis.append(float(nis))
+            if len(self._recent_nis) > 40:
+                self._recent_nis = self._recent_nis[-40:]
+        if not accepted:
+            self._process_noise_scale = min(3.0, self._process_noise_scale * 1.15)
+            return
+        gate = max(self.innovation_gate_sigma**2, 1e-9)
+        relative = min(max(nis / gate, 0.0), 2.0) if math.isfinite(nis) else 1.0
+        # Target scale near 1 when NIS ~ chi2 expectation for 2D (~2).
+        target = 0.35 + 0.9 * relative
+        self._process_noise_scale = float(
+            0.85 * self._process_noise_scale + 0.15 * target
+        )
+        self._process_noise_scale = min(max(self._process_noise_scale, 0.15), 3.0)
 
     def _sigma_points(
         self,
@@ -548,6 +616,7 @@ class JointPeakStateEstimator:
 
         gate_threshold = self.innovation_gate_sigma**2
         if not math.isfinite(nis) or nis > gate_threshold:
+            self._update_process_noise_scale(accepted=False, nis=nis)
             return FilterUpdate(
                 accepted=False,
                 innovation_x_v=float(innovation[0]),
@@ -570,6 +639,7 @@ class JointPeakStateEstimator:
             self.P = self.P - gain @ innovation_covariance @ gain.T
         self._enforce_current_relation()
         self.P = self._stabilize_covariance(self.P)
+        self._update_process_noise_scale(accepted=True, nis=nis)
         return FilterUpdate(
             accepted=True,
             innovation_x_v=float(innovation[0]),

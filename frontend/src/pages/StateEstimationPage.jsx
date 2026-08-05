@@ -36,7 +36,8 @@ import {
 } from "../lib/sweep";
 
 const CALIBRATION_STORAGE_KEY = "nv-current-physical-calibration-v3";
-const FORM_STORAGE_KEY = "nv-state-estimation-form-v1";
+// v2: retuned process-noise / reacquire defaults (2026-08).
+const FORM_STORAGE_KEY = "nv-state-estimation-form-v2";
 const PLOT_BUFFER_KEEP_S = 3600;
 const PLOT_WINDOW_STORAGE_KEY = "nv-live-plot-window-s-v1";
 const PLOT_WINDOW_OPTIONS = [
@@ -84,7 +85,7 @@ const DEFAULT_FORM = {
   search_step_hz: DEFAULT_FREQ_STEP_HZ,
   search_points: 42001,
   search_settle_ms: 10,
-  tracking_settle_ms: 3,
+  tracking_settle_ms: 8,
   sample_averages: 1,
   probe_offset_hz: 250000,
   calibration_points_each_side: 2,
@@ -97,17 +98,20 @@ const DEFAULT_FORM = {
   identity_guard_fraction: 0.2,
   measurement_noise_v: 0,
   initial_frequency_sigma_hz: 250000,
-  initial_velocity_sigma_hz_per_s: 2e6,
-  acceleration_noise_hz_per_s2: 5e6,
-  baseline_process_noise_v_per_sqrt_s: 2e-5,
-  slope_relative_process_noise_per_sqrt_s: 0.02,
+  initial_velocity_sigma_hz_per_s: 500000,
+  acceleration_noise_hz_per_s2: 300000,
+  frequency_random_walk_hz_per_sqrt_s: 80000,
+  velocity_damping_per_s: 0.5,
+  baseline_process_noise_v_per_sqrt_s: 1e-5,
+  slope_relative_process_noise_per_sqrt_s: 0.01,
   calibration_residual_sigma_a: 0,
   innovation_gate_sigma: 4,
   bad_updates_to_reacquire: 4,
-  maximum_frequency_sigma_hz: 1.5e6,
-  maximum_delta_f_sigma_hz: 2e6,
-  maximum_prediction_age_s: 1,
-  max_reacquire_attempts: 5,
+  uncertainty_cycles_to_reacquire: 12,
+  maximum_frequency_sigma_hz: 2.5e6,
+  maximum_delta_f_sigma_hz: 3e6,
+  maximum_prediction_age_s: 1.5,
+  max_reacquire_attempts: 8,
   max_tracking_duration_s: 0,
 };
 

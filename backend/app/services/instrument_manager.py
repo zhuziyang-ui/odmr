@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cmath
+import json
 import math
 import random
 import re
@@ -4005,26 +4006,117 @@ class InstrumentManager:
                 total_blocks=total_blocks,
             )
 
+        def _save_failed_full_scan(
+            frequency_hz: Any,
+            measurements: list[PeakMeasurement],
+            *,
+            reason: str,
+            candidates: list[Any] | None = None,
+        ) -> str | None:
+            """Persist full-scan R/X/Y for offline debug when peak pair fails."""
+            recorder = getattr(self.current_tracking_recordings, "active", None)
+            session_dir = getattr(recorder, "session_dir", None) if recorder else None
+            if session_dir is None:
+                return None
+            try:
+                path = Path(session_dir) / "failed_full_scan.csv"
+                freqs = [float(f) for f in frequency_hz]
+                with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                    handle.write(
+                        "frequency_hz,r_v,x_v,y_v,commanded_frequency_hz,adc_valid\n"
+                    )
+                    for freq, item in zip(freqs, measurements):
+                        handle.write(
+                            f"{freq:.6f},{item.dc:.12e},{item.x1:.12e},"
+                            f"{item.y1:.12e},{item.commanded_frequency_hz:.6f},"
+                            f"{int(bool(item.adc_valid))}\n"
+                        )
+                if candidates:
+                    summary_path = Path(session_dir) / "failed_full_scan_candidates.json"
+                    summary_path.write_text(
+                        json.dumps(
+                            {
+                                "reason": reason,
+                                "n_candidates": len(candidates),
+                                "candidates": [
+                                    {
+                                        "center_hz": float(c.center_hz),
+                                        "prominence_r": float(c.prominence_r),
+                                        "fwhm_hz": float(c.fwhm_hz),
+                                        "score": float(c.score),
+                                        "center_r": float(c.center_r),
+                                    }
+                                    for c in candidates[:20]
+                                ],
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                return str(path)
+            except Exception:
+                return None
+
         def detect_unique_peak_pair(
             frequency_hz: Any,
             measurements: list[PeakMeasurement],
         ) -> tuple[Any, Any]:
             # Structure invariant: each resonance is a lobe–valley–lobe on FM 1f R;
             # center_hz is the valley minimum, never an arbitrary extremum.
+            r_values = [item.dc for item in measurements]
             candidates = find_fm_magnitude_resonances(
                 frequencies_hz=frequency_hz,
-                r_values=[item.dc for item in measurements],
+                r_values=r_values,
                 complex_values=[item.z1 for item in measurements],
                 minimum_prominence_fraction=request.minimum_peak_prominence_fraction,
             )
+            finite_r = [v for v in r_values if math.isfinite(v)]
+            r_min = min(finite_r) if finite_r else float("nan")
+            r_max = max(finite_r) if finite_r else float("nan")
+            r_mean = (
+                statistics.fmean(finite_r) if finite_r else float("nan")
+            )
+            contrast_pct = (
+                100.0 * (r_max - r_min) / max(abs(r_mean), 1e-30)
+                if finite_r
+                else float("nan")
+            )
             if len(candidates) < 2:
+                dump_path = _save_failed_full_scan(
+                    frequency_hz,
+                    measurements,
+                    reason="no_two_lobes",
+                    candidates=candidates,
+                )
+                top = sorted(candidates, key=lambda c: c.score, reverse=True)[:3]
+                top_text = (
+                    "；".join(
+                        f"{c.center_hz/1e9:.4f} GHz (prom={c.prominence_r:.2e})"
+                        for c in top
+                    )
+                    if top
+                    else "无"
+                )
+                dump_note = f" 扫频已保存: {dump_path}" if dump_path else ""
+                settle_note = ""
+                if request.search_settle_ms < 10.0:
+                    settle_note = (
+                        f" 当前 search_settle_ms={request.search_settle_ms:.1f} ms 偏短，"
+                        "建议 ≥15 ms（稳健预设）。"
+                    )
                 raise CurrentTrackingError(
-                    "完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振。",
+                    (
+                        f"完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振"
+                        f"（候选 {len(candidates)} 个；R 对比度≈{contrast_pct:.1f}%；"
+                        f"最强: {top_text}）。{dump_note}{settle_note}"
+                    ),
                     stage="full_scan",
                     code="no_two_lobes",
                     hint=(
-                        "检查 1f FM、扫频是否包住双峰，并增加搜索点数/驻留；"
-                        "峰心必须是双瓣夹谷的谷底。"
+                        "先在 ODMR 页确认 1f FM 下有两个清晰双瓣夹谷；"
+                        "加长初始扫频驻留（≥15 ms）；确认电流/磁场使双峰都落入捕获范围；"
+                        "点数过密但驻留过短会把谱扫糊。"
                     ),
                 )
             try:
@@ -4039,9 +4131,18 @@ class InstrumentManager:
                     ),
                 )
             except ValueError as exc:
+                dump_path = _save_failed_full_scan(
+                    frequency_hz,
+                    measurements,
+                    reason=str(exc),
+                    candidates=candidates,
+                )
                 info = classify_current_tracking_failure(str(exc))
+                tops = sorted(candidates, key=lambda c: c.center_hz)
+                centers = ", ".join(f"{c.center_hz/1e9:.4f} GHz" for c in tops[:6])
+                dump_note = f" 扫频已保存: {dump_path}" if dump_path else ""
                 raise CurrentTrackingError(
-                    str(exc),
+                    f"{exc}（通过显著度的候选 {len(candidates)} 个: {centers}）{dump_note}",
                     stage=info["failed_stage"] if info["failed_stage"] != "unknown" else "full_scan",
                     code=info["error_code"] if info["error_code"] != "unknown" else "pair_select_failed",
                     hint=info["hint"],

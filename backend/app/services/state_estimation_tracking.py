@@ -443,6 +443,16 @@ class StateEstimationTrackingRuntime:
                 calibration_residual_sigma_a=(
                     request.calibration_residual_sigma_a
                 ),
+                frequency_random_walk_hz_per_sqrt_s=getattr(
+                    request,
+                    "frequency_random_walk_hz_per_sqrt_s",
+                    80_000.0,
+                ),
+                velocity_damping_per_s=getattr(
+                    request,
+                    "velocity_damping_per_s",
+                    0.5,
+                ),
             )
             models: dict[PeakName, ComplexPeakModel] = {
                 "left": left_model,
@@ -531,6 +541,8 @@ class StateEstimationTrackingRuntime:
             last_accepted_s: dict[PeakName, float],
             rejected_by_peak: dict[PeakName, int],
             timestamp_s: float,
+            *,
+            uncertainty_streak: int,
         ) -> str:
             if max(rejected_by_peak.values()) >= request.bad_updates_to_reacquire:
                 return "consecutive_innovation_rejections"
@@ -539,7 +551,18 @@ class StateEstimationTrackingRuntime:
                 timestamp_s - last_accepted_s["right"],
             ) > request.maximum_prediction_age_s:
                 return "prediction_age_exceeded"
-            if (
+            # Hysteresis: only re-scan after sustained uncertainty, not one blip.
+            uncertainty_limit = max(
+                1,
+                int(
+                    getattr(
+                        request,
+                        "uncertainty_cycles_to_reacquire",
+                        12,
+                    )
+                ),
+            )
+            if uncertainty_streak >= uncertainty_limit and (
                 output["f_left_sigma_hz"] > request.maximum_frequency_sigma_hz
                 or output["f_right_sigma_hz"]
                 > request.maximum_frequency_sigma_hz
@@ -562,6 +585,73 @@ class StateEstimationTrackingRuntime:
                 return "splitting_outside_physical_range"
             return ""
 
+        def confidence_breakdown(
+            output: dict[str, Any],
+            *,
+            maximum_prediction_age_s: float,
+            update: FilterUpdate,
+        ) -> dict[str, float]:
+            """Explain why confidence falls after a full scan.
+
+            Right after FULL_SCAN/CALIBRATE the posterior P is tight (high
+            confidence).  Each predict step injects process noise; single-sided
+            FM probes only weakly observe frequency, so σ_f grows and the
+            uncertainty term of confidence decays until the next reacquire.
+            """
+            f_sigma = max(
+                float(output["f_left_sigma_hz"]),
+                float(output["f_right_sigma_hz"]),
+            )
+            frequency_score = math.exp(
+                -0.5
+                * (f_sigma / max(request.maximum_frequency_sigma_hz, 1.0)) ** 2
+            )
+            splitting_score = math.exp(
+                -0.5
+                * (
+                    float(output["splitting_sigma_hz"])
+                    / max(request.maximum_delta_f_sigma_hz, 1.0)
+                )
+                ** 2
+            )
+            uncertainty_score = math.sqrt(
+                max(frequency_score * splitting_score, 0.0)
+            )
+            freshness_score = max(
+                0.0,
+                1.0
+                - maximum_prediction_age_s
+                / max(request.maximum_prediction_age_s, 1e-9),
+            )
+            innovation_score = (
+                math.exp(
+                    -0.5
+                    * min(
+                        update.normalized_innovation_squared
+                        / max(update.gate_threshold, 1e-12),
+                        10.0,
+                    )
+                )
+                if math.isfinite(update.normalized_innovation_squared)
+                else 0.0
+            )
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    uncertainty_score * freshness_score * innovation_score,
+                ),
+            )
+            return {
+                "confidence_0_to_1": confidence,
+                "uncertainty_score": uncertainty_score,
+                "frequency_uncertainty_score": frequency_score,
+                "splitting_uncertainty_score": splitting_score,
+                "freshness_score": freshness_score,
+                "innovation_score": innovation_score,
+            }
+
+        stop_reason = ""
         try:
             if not manager.prepare_microwave_fast_tracking():
                 raise RuntimeError(
@@ -570,6 +660,7 @@ class StateEstimationTrackingRuntime:
                 )
             estimator, models, last_accepted_s = full_acquire("initial")
             rejected_by_peak: dict[PeakName, int] = {"left": 0, "right": 0}
+            uncertainty_streak = 0
             next_peak: PeakName = "left"
             next_probe_sign: dict[PeakName, int] = {"left": -1, "right": -1}
             tracking_started_s = clock()
@@ -648,41 +739,22 @@ class StateEstimationTrackingRuntime:
                         measurement.timestamp_s,
                     )
                 )
-                uncertainty_score = math.exp(
-                    -0.5
-                    * (
-                        output["splitting_sigma_hz"]
-                        / request.maximum_delta_f_sigma_hz
-                    )
-                    ** 2
+                if (
+                    output["f_left_sigma_hz"] > request.maximum_frequency_sigma_hz
+                    or output["f_right_sigma_hz"]
+                    > request.maximum_frequency_sigma_hz
+                    or output["splitting_sigma_hz"]
+                    > request.maximum_delta_f_sigma_hz
+                ):
+                    uncertainty_streak += 1
+                else:
+                    uncertainty_streak = 0
+                scores = confidence_breakdown(
+                    output,
+                    maximum_prediction_age_s=maximum_prediction_age_s,
+                    update=update,
                 )
-                freshness_score = max(
-                    0.0,
-                    1.0
-                    - maximum_prediction_age_s
-                    / request.maximum_prediction_age_s,
-                )
-                innovation_score = (
-                    math.exp(
-                        -0.5
-                        * min(
-                            update.normalized_innovation_squared
-                            / max(update.gate_threshold, 1e-12),
-                            10.0,
-                        )
-                    )
-                    if math.isfinite(update.normalized_innovation_squared)
-                    else 0.0
-                )
-                confidence = max(
-                    0.0,
-                    min(
-                        1.0,
-                        uncertainty_score
-                        * freshness_score
-                        * innovation_score,
-                    ),
-                )
+                confidence = scores["confidence_0_to_1"]
                 elapsed_tracking_s = max(
                     measurement.timestamp_s - tracking_started_s,
                     1e-9,
@@ -718,6 +790,11 @@ class StateEstimationTrackingRuntime:
                     "output_valid": output_valid,
                     "invalid_reason": invalid_reason,
                     "confidence_0_to_1": confidence,
+                    "confidence_components": scores,
+                    "process_noise_scale": float(
+                        getattr(estimator, "_process_noise_scale", 1.0)
+                    ),
+                    "uncertainty_streak": uncertainty_streak,
                     "maximum_prediction_age_s": maximum_prediction_age_s,
                     "left_prediction_age_s": max(
                         0.0,
@@ -756,13 +833,15 @@ class StateEstimationTrackingRuntime:
                     last_accepted_s,
                     rejected_by_peak,
                     measurement.timestamp_s,
+                    uncertainty_streak=uncertainty_streak,
                 )
                 if reason:
                     if reacquire_count >= request.max_reacquire_attempts:
-                        raise RuntimeError(
+                        stop_reason = (
                             "状态估计失锁且重新扫峰次数已达上限："
                             f"{reason}"
                         )
+                        raise RuntimeError(stop_reason)
                     reacquire_count += 1
                     publish(
                         {
@@ -774,12 +853,21 @@ class StateEstimationTrackingRuntime:
                     )
                     estimator, models, last_accepted_s = full_acquire(reason)
                     rejected_by_peak = {"left": 0, "right": 0}
+                    uncertainty_streak = 0
                     next_peak = "left"
                     next_probe_sign = {"left": -1, "right": -1}
 
             status = "completed"
         except StateEstimationCancelled:
             status = "cancelled"
+            stop_reason = stop_reason or "user_or_websocket_cancelled"
+        except RuntimeError as exc:
+            message = str(exc)
+            if "重新扫峰次数已达上限" in message:
+                status = "error"
+                stop_reason = message
+            else:
+                raise
         finally:
             try:
                 if original_microwave_config:
@@ -798,5 +886,6 @@ class StateEstimationTrackingRuntime:
             "accepted_update_count": accepted_update_count,
             "rejected_update_count": rejected_update_count,
             "reacquire_count": reacquire_count,
+            "stop_reason": stop_reason,
             "last_point": last_point,
         }

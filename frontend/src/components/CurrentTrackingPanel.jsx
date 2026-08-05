@@ -17,6 +17,7 @@ import { notifications } from "@mantine/notifications";
 import { api, formatGHz, wsUrl } from "../lib/api";
 import {
   DEFAULT_FREQ_STEP_HZ,
+  MAX_LINEAR_SWEEP_POINTS,
   computeLinearSweepPoints,
   formatStepHz,
 } from "../lib/sweep";
@@ -498,6 +499,14 @@ export function CurrentTrackingPanel({
       });
       return false;
     }
+    if (searchPoints > MAX_LINEAR_SWEEP_POINTS) {
+      notifications.show({
+        color: "red",
+        title: "参数无效",
+        message: `搜索点数 ${searchPoints} 超过上限 ${MAX_LINEAR_SWEEP_POINTS}，请增大搜索步进。`,
+      });
+      return false;
+    }
     if (!(settleMs > 0)) {
       notifications.show({
         color: "red",
@@ -505,6 +514,14 @@ export function CurrentTrackingPanel({
         message: "初始扫频稳定等待必须大于 0。",
       });
       return false;
+    }
+    if (settleMs < 10) {
+      notifications.show({
+        color: "orange",
+        title: "驻留偏短",
+        message: `初始扫频稳定等待 ${settleMs.toFixed(1)} ms 偏短，全频认峰易失败。稳健预设建议 ≥15 ms（锁相 3 阶滤波需数个时间常数）。`,
+        autoClose: 8000,
+      });
     }
     if (!(numberOr(form.probe_offset_hz) > 0)) {
       notifications.show({
@@ -1095,13 +1112,14 @@ export function CurrentTrackingPanel({
         />
         <NumberInput
           label="搜索点数（自动计算）"
-          description={`步进 ${formatStepHz(currentForm.search_step_hz ?? DEFAULT_FREQ_STEP_HZ)}`}
+          description={`步进 ${formatStepHz(currentForm.search_step_hz ?? DEFAULT_FREQ_STEP_HZ)} · 上限 ${MAX_LINEAR_SWEEP_POINTS.toLocaleString()}`}
           value={currentForm.search_points}
           disabled
           readOnly
         />
         <NumberInput
           label="初始扫频稳定等待 (ms)"
+          description="全频认峰关键：稳健预设 15 ms；过短（如 3 ms）易 no_two_lobes"
           value={currentForm.settle_ms}
           disabled={isTracking}
           min={0.1}
